@@ -1,0 +1,68 @@
+#!/usr/bin/perl
+#
+# psi-accts: Creates CSV report from Psi accounts.xml data
+#            This includes deobfuscating user passwords
+#
+# Hal Pomeranz, hal@deer-run.com
+
+use strict;
+
+my $collecting = 0;
+my($acct_name, $acct_jid, $enc_password, %roster) = ();
+my($code, $name, $jid, $grp) = ();
+
+my $outputs = 0;
+
+while (<>) {
+    if (/<roster-cache>/)      { $collecting = 1; next; }
+    elsif (m|</roster-cache>|) { $collecting = 0; next; }
+
+    if ($collecting) {
+	if (/<a\d+>/)              { ($code) = /<(a\d+)>/; }
+	elsif (m|<item>.*</item>|) { ($grp) = m|<item>(.*)</item>|; }
+	elsif (my($fld, $val) = m|<(\S+) type="QString" >(.*)</|) {
+	    if ($fld eq 'name')   { $name = $val; }
+	    elsif ($fld eq 'jid') { $jid = $val; }
+	}
+	elsif (m|</$code>|) {
+	    $roster{$code} = { 'name' => $name, 'jid' => $jid, 
+			       'group' => $grp };
+	}
+    }
+
+    if (!$collecting) {
+	if (my($fld, $val) = m|<(\S+) type="QString" >(.*)</|) {
+	    if ($fld eq 'name')   { $acct_name = $val; }
+	    elsif ($fld eq 'jid') { $acct_jid = $val; }
+	    elsif ($fld eq 'password') { $enc_password = $val; }
+	}
+
+	if (m|</a\d+>|) {
+	    # Password decryption routine from 
+	    # http://blogmal.42.org/rev-eng/psi-password.story
+	    my $acct_password = undef;
+	    if (length($acct_jid) && length($enc_password)) {
+		$enc_password =~ s/..(..)/chr(hex($1))/ge;
+		$acct_password = 
+		    substr($enc_password ^ $acct_jid, 0, length($enc_password));
+	    }
+
+	    print "\r\n\"=====\"\r\n\r\n" if ($outputs++);
+
+	    print "\"Acct Name:\",\"$acct_name\"\r\n";
+	    print "\"Acct JID:\",\"$acct_jid\"\r\n";
+	    print "\"Acct Password:\",\"$acct_password\"\r\n";
+
+	    print "\r\n\"", join('","', 'Group Name', 'Contact', 'Contact JID'), "\"\r\n";
+	    for $code (sort { $roster{$a}{'group'} cmp $roster{$b}{'group'} ||
+			      $roster{$a}{'name'} cmp $roster{$b}{'name'} ||
+			      $roster{$a}{'jid'} cmp $roster{$b}{'jid'} }
+		       keys(%roster)) {
+		print '"', join('","', $roster{$code}{'group'},
+			               $roster{$code}{'name'},
+			               $roster{$code}{'jid'}), "\"\r\n";
+	    }
+	    ($acct_name, $acct_jid, $enc_password, %roster) = ();
+	}
+    }
+}

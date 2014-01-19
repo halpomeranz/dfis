@@ -1,0 +1,458 @@
+#!/usr/bin/perl
+#
+# fib -- Find Indirect Blocks
+#
+# Requires blkcat & fsstat utilities from The Sleuthkit (www.sleuthkit.org)
+# Be sure to set $BLKCAT/$FSSTAT variables below to the appropriate path name 
+# if the binary is not in your normal search path.
+#
+# NOTE: Assumes little-endian byte order by default.  If you're using
+# this on a big-endian machine, use the -B option.  No testing has been
+# done with -B, however.
+#
+# Hal Pomeranz (hal.pomeranz@mandiant.com), 2012-08-21
+#
+
+use strict;
+use vars qw($opt_a $opt_A $opt_B $opt_d $opt_D $opt_o $opt_R);
+use Getopt::Std;
+$Getopt::Std::STANDARD_HELP_VERSION = 1;    # Terminate after --help
+
+my $BLKCAT = 'blkcat';
+my $FSSTAT = 'fsstat';
+my ($idb, $blk) = ();
+
+sub HELP_MESSAGE { 
+    die <<"EoUseMsg";
+Usage: $0 [-dB] [-D <dir>] [-a|A address] [-R] [-o offset] device [start [end]]
+
+-d          Print debugging output
+-B          Use big-endian byte ordering
+-o offset   Specify sector offset in image (passed to Sleuthkit tools)
+-D <dir>    Dump block chains to files in <dir>
+-a address  Look for indirect block that contains given address
+-A address  Find all indirect blocks that contain specified address
+-R          Reassemble full block chain-- used only with -a/-A
+
+<device>    can be any type that Sleuthkit can parse
+<start>     is block number to being search from
+<end>       is block number to stop searching at
+EoUseMsg
+}
+
+# Parse arguments
+getopts('a:A:dD:Bo:R') || HELP_MESSAGE();
+my $Debug = $opt_d;
+my $Big_Endian = $opt_B;
+my $device = shift(@ARGV);
+my $start_block = shift(@ARGV);
+my $end_block = shift(@ARGV);
+
+# Sanity checking
+die "Cannot read device $device\n" unless (-r $device);
+
+# Deals with -a/-A arguments.  -A means $Find_All.
+#
+if (defined($opt_a) && defined($opt_A)) {
+    warn "May only use one of -a or -A\n";
+    HELP_MESSAGE();     # terminates program
+}
+my $Find_Addr = $opt_a || $opt_A;
+my $Find_All = $opt_A;
+
+# Now sanity check -R
+my $Reassemble = undef;
+if ($opt_R) {
+    unless ($Find_Addr) {
+	warn "-R only makes sense with -a/-A\n";
+	HELP_MESSAGE();     # terminates program
+    }
+    $Reassemble = 1;
+}
+
+# Only one output mode can be selected.
+my $Output_Dir = $opt_D;
+if (length($Output_Dir) && $Find_Addr) {
+    warn "May not use -D one with -a/-A\n";
+    HELP_MESSAGE();     # terminates program
+}
+if (length($Output_Dir) && !(-d $Output_Dir)) {
+    warn "$Output_Dir does not exist. Creating.\n";
+    mkdir($Output_Dir) || die "Failed to create $Output_Dir: $!\n";
+}
+
+# Do we need to store indirect block chain data or are we just looking
+# for indirect blocks that contain a specific block address?
+#
+my $Collect_Chains = $Reassemble || !$Find_Addr;
+
+if ($Find_Addr && $Debug) {
+    print STDERR "Searching for ";
+    if ($Find_All) {
+	print STDERR "all entries ";
+    }
+    else { print STDERR "entry "; }
+    print STDERR "matching $Find_Addr";
+    print STDERR ". Reassembling chains." if ($Reassemble);
+    print STDERR "\n";
+}
+
+# If "-o" option was specified, make sure this gets passed into blkcat/fsstat
+$BLKCAT .= " -o $opt_o" if ($opt_o);
+$FSSTAT .= " -o $opt_o" if ($opt_o);
+
+
+# Run fsstat to get range of block numbers so that we can either
+# (a) know the range of blocks we need to search, or (b) sanity check
+# the "start" and "end" values entered by the user on the command-line.
+#
+open(FSSTAT, "$FSSTAT $device |") || die "Can't run '$FSSTAT $device': $!\n";
+my($init_block, $fin_block, $block_size) = ();
+while (<FSSTAT>) {
+    if (/^Block Range: /) {
+	($init_block, $fin_block) = /^Block Range: (\d+) - (\d+)/;
+	$fin_block = $fin_block - 1;    # TSK display bug?
+    }
+    elsif (/Block Size: /) {
+	$block_size = (split(' '))[2];
+	last;
+    }
+}
+close(FSSTAT);
+
+# Use the fsstat info to do some sanity checking.  If start_block and
+# end_block were not specified by the user, then set them from the
+# fsstat output.
+#
+die "Unable to determine block range, got [$init_block, $fin_block]\n" 
+    unless (defined($init_block) && defined($fin_block));
+die "Unable to determine block size (got $block_size)\n" 
+    unless ($block_size > 0);
+
+if (defined($start_block)) {
+    die "Invalid starting block $start_block, must be [$init_block, $fin_block]\n" unless ($start_block >= $init_block && $start_block <= $fin_block);
+}
+else { $start_block = $init_block; }
+
+if (defined($end_block)) {
+    die "End block $end_block must be greater than start block $start_block\n"
+	unless ($end_block >= $start_block);
+    die "End block $end_block must be less than max block $fin_block\n"
+	unless ($end_block <= $fin_block);
+}
+else { $end_block = $fin_block; }
+
+# We're going to dump all of the blocks in our search space with "blkcat -h",
+# but we have to be careful that we don't dump so many blocks that the byte
+# offset values in the "blkcat -h" output end up wrapping around.  So we're 
+# going to dump 100,000 blocks at a time until we run out of blocks.
+#
+# Call check_for_idbs() on each group of blocks.  If the user specified
+# -a/-A without -R on the command line, then check_for_idbs() just looks for
+# the specified block address within indirect blocks.  Otherwise, 
+# check_for_idbs() updates global %pib ("possible indirect blocks"), 
+# %first_block, and %last_block hashes which will be used later to 
+# reassemble block chains.
+#
+my (@addrs, %pib, %first_block, %last_block) = ();
+my $blk_ct = $end_block - $start_block + 1;
+while ($blk_ct) {
+    my $amt_to_dump = ($blk_ct > 100000) ? 100000 : $blk_ct;
+    check_for_idbs($device, $start_block, $amt_to_dump);
+    $blk_ct = $blk_ct - $amt_to_dump;
+    $start_block += $amt_to_dump;
+}
+
+# If -a/-A were specified on command-line without -R, then block addresses 
+# are output in the loop above.  So we're done.
+#
+exit(0) unless ($Collect_Chains);
+
+# Try to recognize double and treble indirect block groups by simply
+# looking for multiple possible indirect blocks in a row.  After
+# check_for_idbs() is done:
+#
+# %pib           A hash whose keys are the block numbers of the possible 
+#                indirect blocks and whose values are a list of the block
+#                addresses contained in that block.  The last address in
+#                the list will be zero if not all block addresses pointers
+#                in the indirect block were used.
+#
+# %first_block   A hash whose keys are the same as %pib but whose values
+#                are the block address contained in the first four bytes
+#                of the given block
+#
+# So defined($pib{$first_block{$blk}}) is true if $blk is an indirect
+# block where the first block address in the block is the address of 
+# another indirect block-- i.e. we've got two indirect blocks in a row,
+# meaning at least double indirection.  
+#
+# defined($pib{$first_block{$first_block{$blk}}}) will be true if $blk
+# is the start of a triple indirect block chain.
+#
+# Note that the double indirect block chains that are pointed to by a
+# treble indirect block will end up in the @double list.  That means that
+# they will be reassembled in the loop after this one.  Then the complete
+# treble indirect chain we be put back together in the following loop.
+#
+my(@double, @treble, %block_status) = ();
+foreach $blk (sort { $a <=> $b } keys(%pib)) {
+    next unless (defined($pib{$first_block{$blk}}));
+    if (defined($pib{$first_block{$first_block{$blk}}})) {
+	print STDERR "Treble indirect block cluster starting at $blk\n"
+	    if ($Debug);
+	push(@treble, $blk);
+	$block_status{$blk} = 'treble';
+    }
+    else {
+	print STDERR "Double indirect block cluster starting at $blk\n"
+	    if ($Debug);
+	push(@double, $blk);
+	$block_status{$blk} = 'double';
+    }
+}
+
+# Process all of the double indirect chains found (including those that
+# are part of a treble indirect chain-- see above) by "flattening" them
+# into a single list of data block addresses.  $idb is the address of
+# the first indirect block, so assign the new flattened list of blocks
+# to $pib{$idb} and delete the %pib entries for the other indirect blocks.
+#
+# It's possible that some of indirect blocks have been reused and clobbered.
+# %bad_blocks tracks the maximum number of block addresses that might
+# have been lost as a result.  We continue to increment this value as we
+# reassemble the block chains, just to give the operator an idea of
+# how damaged the block chains have become.
+#
+my %bad_blocks = ();
+foreach $idb (@double) {
+    print STDERR "Processing double indirect block at $idb\n" if ($Debug);
+    @addrs = ();
+    foreach $blk (@{$pib{$idb}}) {
+	last unless ($blk);      # stop if we hit a null block address
+	print STDERR "+ Indirect block $blk\n" if ($Debug);
+	if (defined($pib{$blk})) {
+	    push(@addrs, @{$pib{$blk}});
+	}
+	else {
+	    print STDERR "*** Indirect block $blk reused? Skipping\n" if ($Debug);
+	    $bad_blocks{$idb} += ($block_size / 4);
+	}
+	delete($pib{$blk});
+    }
+    $pib{$idb} = [ @addrs ];
+}
+
+# Now that the double indirect chains have been "flattened", do the same
+# thing for any treble indirect chains.
+#
+foreach $idb (@treble) {
+    print STDERR "Processing treble indirect block at $idb\n" if ($Debug);
+    @addrs = ();
+    foreach $blk (@{$pib{$idb}}) {
+	last unless ($blk);
+	print STDERR "+ Indirect block $blk\n" if ($Debug);
+	if (defined($pib{$blk})) {
+	    push(@addrs, @{$pib{$blk}});
+	}
+	else {
+	    print STDERR "*** Double indirect block $blk reused? Skipping\n" if ($Debug);
+	    $bad_blocks{$idb} += (($block_size / 4) ** 2);
+
+	}
+	$bad_blocks{$idb} += $bad_blocks{$blk};
+	delete($pib{$blk});
+    }
+    $pib{$idb} = [ @addrs ];
+}
+
+# Now that we've flattened the double and treble indirect chains, see if
+# we can integrate the single indirect block that preceeds them.  Here we're
+# using the %last_block hash that was also created by check_for_idbs().
+# Again the keys of %last_block are the block numbers of the possible
+# indirect blocks but the values are the block address of the last block
+# pointer in the indirect block-- which may be zero if not all block pointers
+# were consumed.
+#
+# So we're looking for indirect blocks whose last block pointer is NON-ZERO
+# and where (last block pointer)+1 is another indirect block.  When we find
+# this condition, then we merge the block lists of the two indirect blocks
+# and delete the %pib entry for the second indirect block.
+#
+my @idblist = sort { $a <=> $b } keys(%pib);
+foreach $blk (@idblist) {
+    my $lb = $last_block{$blk};
+    next unless ($lb);
+
+    # Don't do anything if the block we're looking at is the start of
+    # a double/treble indirect block chain.
+    #
+    if (defined($block_status{$blk})) {
+	warn "$blk is a unmerged $block_status{$blk} indirect w/ last data block $pib{$blk}[-1]\n";
+	next;
+    }
+
+    my $nb = $lb + 1;
+    if ($pib{$nb}) {
+	print STDERR "Merging block run at $nb with initial indirect block at $blk\n" if ($Debug);
+	push(@{$pib{$blk}}, @{$pib{$nb}});
+	$bad_blocks{$blk} += $bad_blocks{$nb};
+	delete($pib{$nb});
+    }
+    else {
+        # Not a fatal error, but unlikely...
+	warn "Full indirect block $blk with last block $lb-- $nb is not an indirect block\n";
+    }
+}
+
+# There's two possible output modes here:
+#    
+# 1) "Terse" (default) output mode where we output the block numbers of 
+#     the first indirect block in the chain and a count of the total number 
+#     of data blocks in the chain.
+#
+# 2) -D mode where we create a directory of files.  Each file is named
+#    for an initial indirect block and lists all of the data blocks in
+#    the run.
+#
+# Either way, indicate if this is an unmerged double/treble block and
+# the possible number of blocks missing due to indirect block corruption.
+#
+foreach $blk (sort { $a <=> $b } keys(%pib)) {
+    next if ($Reassemble && !(grep($_ == $Find_Addr, @{$pib{$blk}})));
+
+    if (length($Output_Dir)) {
+	open(OUT, "> $Output_Dir/$blk") || 
+	    die "Can't write to $Output_Dir/$blk: $!\n";
+	print OUT "*** Unmerged $block_status{$blk} indirect block-- last data block $pib{$blk}[-1]\n"
+	    if ($block_status{$blk});
+	print OUT "*** $bad_blocks{$blk} blocks potentially missing\n" 
+	    if ($bad_blocks{$blk});
+	print OUT join("\n", @{$pib{$blk}}), "\n";
+	close(OUT);
+    }
+    else {
+	my $blkct = scalar(@{$pib{$blk}});
+	$blkct = $blkct - 1 unless ($last_block{$blk});
+	print "$blk\t$blkct";
+	if ($block_status{$blk} || $bad_blocks{$blk}) {
+	    print "\t\t*** ";
+	    print "$block_status{$blk} (last data $pib{$blk}[-1])"
+		if ($block_status{$blk});
+	    print ', ' if ($block_status{$blk} && $bad_blocks{$blk});
+	    print "missing $bad_blocks{$blk}" if ($bad_blocks{$blk});
+	}
+	print "\n";
+    }
+}
+
+##### PROGRAM ENDS HERE.  Subroutines below.
+
+# INPUTS: $device    device or image to scan
+#         $start     starting block address
+#         $len       number of blocks to check
+#
+# Also references: $Debug            print debugging output
+#                  $Big_Endian       use big-endian byte ordering
+#
+#                  $Find_Addr        address of block we're looking for
+#                  $Find_All         find all instanaces of $Find_Addr or
+#                                      stop after first hit?
+#                  $Collect_Chains   are we trying to reassemble block chains?
+#
+# SETS UP THESE GLOBAL VARIABLES:
+#
+# %pib           A hash whose keys are the block numbers of the possible 
+#                indirect blocks and whose values are a list of the block
+#                addresses contained in that block.  The last address in
+#                the list will be zero if not all block addresses pointers
+#                in the indirect block were used.
+#
+# %first_block   A hash whose keys are the same as %pib but whose values
+#                are the block address contained in the first four bytes
+#                of the given block
+#
+# %last_block    A hash whose keys are the same as %pib but whose values
+#                are the block address of the last block pointer in the
+#                the block (can be zero).
+#
+# RETURNS: void
+#
+sub check_for_idbs {
+    my($device, $start, $len) = @_;
+
+    print STDERR "Dumping $len blocks starting at block $start\n"
+	if ($Debug);
+    open(BLKCAT, "$BLKCAT -h $device $start $len |") ||
+	die "Failed to run '$BLKCAT -h $device $start $len': $!\n";
+
+    my $blk_addr = $start;
+    my $first_checked = 0;
+    my $is_idb = 0;
+    my @addrs = ();
+    while (<BLKCAT>) {
+	my($addr, @pieces) = (split(' '))[0,1,2,3,4];
+
+	# Do this code when we hit a block boundary or the blank line
+        # at the end of the blkcat output.  If the block we just scanned
+        # appears to be an indirect block and we're not looking for a
+	# specific block address, then update %pib, %first_block,
+        # and %last_block appropriately.  Always reset all loop control
+        # variables so we can start fresh for the new block.
+        #
+	if (($addr % $block_size) == 0 || /^\s*$/) {
+	    if ($is_idb && $Collect_Chains) {
+		# Strip out all but one null block pointer at end of block
+		if ($addrs[$#addrs] == 0) {
+		    while ($addrs[($#addrs - 1)] == 0) { pop(@addrs); }
+		}
+		$pib{$blk_addr} = [ @addrs ];
+		$first_block{$blk_addr} = $addrs[0];
+		$last_block{$blk_addr} = $addrs[$#addrs];
+	    }
+	    if ($Debug) {
+		print STDERR "\nPossible indirect block: $blk_addr\n" 
+		    if ($is_idb);
+		print STDERR "." if (($blk_addr % 1000) == 0);
+	    }
+	    $blk_addr = int($addr/$block_size) + $start;
+	    @addrs = ();
+	    $first_checked = 0;
+	    $is_idb = 0;
+	}
+
+	# This bit processes each line of blkcat output.  For the first
+	# line of output at each block boundary, check to see if the first
+	# four bytes correspond to the (address of this block)+1.  If so
+	# then, set $is_idb to indicate that this is a possible indirect
+	# block.  Also set $first_checked to indicate we've processed the
+	# first line of output for this block.
+	#
+	# Unless $is_idb is true, we don't care about the rest of the
+	# information about this block.  If $is_idb is true then either
+	# check to see if the block contains the block address we're
+	# looking for ($Find_Addr) or scarf up all of the block addresses 
+	# into @addrs() for rebuilding the block chains.
+	#
+	next if ($first_checked && !$is_idb);
+	foreach my $a (@pieces) {
+	    $a =~ s/(\w\w)(\w\w)(\w\w)(\w\w)/$4$3$2$1/ unless ($Big_Endian);
+	    my $val = hex($a);
+	    unless ($first_checked) {
+		$is_idb = ($val == ($blk_addr + 1));
+		$first_checked = 1;
+	    }
+	    last unless ($is_idb);
+	    if ($Collect_Chains) {
+		push(@addrs, $val);
+	    }
+	    else {
+		next unless ($Find_Addr == $val);
+		print "$blk_addr\n";
+		exit(0) unless ($Find_All);
+	    }
+	}
+    }
+    close(BLKCAT);
+    print STDERR "\n" if ($Debug);
+}

@@ -1,0 +1,186 @@
+#!/usr/bin/perl
+#
+# byte2filename -- Automation around TSK tools to convert "strings -t d ..."
+#                  output into a form containing inode and file path info
+#
+# Hal Pomeranz, hal@deer-run.com
+
+use strict;
+use Getopt::Std;
+use Fcntl;
+use DB_File;
+
+$Getopt::Std::STANDARD_HELP_VERSION = 1;
+sub VERSION_MESSAGE {}
+sub HELP_MESSAGE {
+die <<'EoUseMsg';
+Usage: byte2filename -D db-path -C [-m prefix] [-b blksize] [-o offset] image
+       byte2filename -D db-path -Q [file ...]
+       byte2filename -D db-path [ -I metadata-addr | -B block-addr ]
+       byte2filename [-D db-path] [-F mntpt] [-m prefix] \
+                     [-b blksize] [-o offset] image [file ...]
+
+-m prefix    Path prefix for file paths
+-b blksize   Block size for file system (default 4096)
+-o offset    Offset into drive image
+-F mntpt     Use "find mntpt -inum ..." rather than ffind
+-D dbpath    Create cache of block/inode/filename at dbpath
+-C           Pre-caculate (allocated) block/inode/filename cache and exit
+-Q           Use only pre-cached block/inode/filename info (no TSK commands)
+EoUseMsg
+}
+
+
+my %opts = ();
+getopts('b:B:CD:F:I:m:o:Q', \%opts);
+
+my $blksize = $opts{'b'} || 4096;
+my $offset = undef;
+$offset = "-o $opts{'o'}" if ($opts{'o'});
+my $path_prefix = $opts{'m'};
+$path_prefix =~ s|/$||;
+
+my $database_path = $opts{'D'};
+my(%inode, %file, %status) = ();
+if (defined($database_path)) {
+    tie(%status, 'DB_File', $database_path . '_stat', O_RDWR|O_CREAT, 0644)
+	or die "Stat: $!\n";
+    tie(%inode, 'DB_File', $database_path . '_blocks', O_RDWR|O_CREAT, 0644)
+	or die "Blocks: $!\n";
+    tie(%file, 'DB_File', $database_path . '_inodes', O_RDWR|O_CREAT, 0644)
+	or die "Inodes: $!\n";
+}
+
+if (defined($opts{'B'})) {
+    my $blk = $opts{'B'};
+    if (defined($inode{$blk})) {
+	print "$blk  A\:$inode{$blk}\:$file{$inode{$blk}}\:\:\n";
+    }
+    else { print "$blk  NA::::\n"; }
+    exit();
+}
+if (defined($opts{'I'})) {
+    my $inode = $opts{'I'};
+    if (defined($file{$inode})) {
+	print "$inode  A\:$inode\:$file{$inode}\:\:\n";
+    }
+    else { print "$inode  NA::::\n"; }
+    exit();    
+}
+
+my $quick = defined($opts{'Q'});
+my $image = undef;
+$image = shift(@ARGV) unless ($quick);
+if (defined($opts{'C'})) {
+    create_index_db($image, $offset, $path_prefix);
+    exit();
+}
+
+my $file_path = $opts{'F'};
+my $find_cmd = undef;
+if (length($file_path)) { $find_cmd = "find $file_path -inum"; }
+else                    { $find_cmd = "ffind $offset \"$image\""; }
+
+
+while (<>) {
+    my($bytes, $rest) = /^\s*(\d+)\s+(.*)$/;
+    my $blk = int($bytes/$blksize);
+
+    if ($quick) {                       # using pre-cached DB only
+	if (defined($inode{$blk})) {
+	    print "$blk  A\:$inode{$blk}\:$file{$inode{$blk}}\:\:  $rest\n";
+	}
+	else { print "$blk  NA::::  $rest\n"; }	
+	next;
+    }
+
+    unless (defined($status{$blk})) {
+	open(BS, "blkstat $offset \"$image\" $blk |") || 
+	    die "blkstat $offset $image $blk: $!\n";
+	while (<BS>) {
+	    next unless (/Allocated/);
+	    ($status{$blk} = $_) =~ s/[^NA]//g;
+	    last;
+	}
+	close(BS);
+    }
+
+    my $stat = $status{$blk};
+    if ($stat eq 'NA') {
+	print "$blk  $stat\:\:\:\:  $rest\n";
+	next;
+    }
+    if (defined($inode{$blk})) {
+	print "$blk  $stat:$inode{$blk}:$file{$inode{$blk}}\:\:  $rest\n";
+	next;
+    }
+
+    my $inode = `ifind -d $blk $offset "$image"`;
+    if ($inode =~ /not found/) {
+	print "$blk  $stat\:NF\:\:\:  $rest\n";
+	$inode{$blk} = 'NF';
+	next;
+    }
+    chomp($inode);
+
+    my $filename = `$find_cmd $inode`;
+    if (!length($filename) || $filename =~ /not found/) { 
+	$filename = 'NF'; 
+    }
+    else { 
+	chomp($filename);
+	$filename =~ s/^$file_path//;
+	$filename = "$path_prefix/$filename";
+    }
+    print "$blk  $stat\:$inode\:$filename\:\:  $rest\n";
+    $file{$inode} = $filename;
+
+    open(IS, "istat $offset \"$image\" $inode |") ||
+	die "istat $offset $image $inode: $!\n";
+    while (<IS>) {
+	next unless (/^[\d\s]+$/);
+	foreach my $blkno (split(/\s+/)) { 
+	    next if ($blkno == 0);
+	    $inode{$blkno} = $inode;
+	}
+    }
+    close(IS);
+
+}
+
+
+sub create_index_db {
+    my($image, $offset, $path_prefix) = @_;
+
+    open(FLS, "fls -urp $offset $image |")  || die "fls: $!\n";
+    my $count = 0;
+    while (<FLS>) {
+	chomp;
+	$count++;
+
+	my($inode, $path) = /^\S+\s+(\d+(?:-\d+-\d+)?):\s+(.+)$/;
+	unless (defined($inode) && defined($path)) {
+	    warn "$count: $_\n";
+	    next;
+	}
+
+	unless (open(ISTAT, "istat $offset $image $inode |")) {
+	    warn "$count: istat ... $inode: $!\n";
+	    next;
+	}
+
+	while (<ISTAT>) {
+	    next unless (/^[\d\s]+$/);
+	    chomp;
+	    foreach my $blkno (split(/\s+/)) {
+		next if ($blkno == 0);
+		$inode{$blkno} = $inode;
+	    }
+	}
+	close(ISTAT);
+	$file{$inode} = "$path_prefix/$path";
+	print STDERR "." unless ($count % 100);
+    }
+    close(FLS);
+    print STDERR "\n";
+}

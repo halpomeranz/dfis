@@ -1,0 +1,130 @@
+#!/usr/bin/perl
+#
+# mlocate-time -- Parses file/directory and timestamp information from
+#                 Linux mlocate.db(5) files.
+#
+# The format of these files is described in the mlocate.db(5) manual page.  
+# I've included the relevant sections of the manual page in a comment at 
+# the end of this program.
+#
+# Hal Pomeranz, hal@deer-run.com   2013-08-28
+#
+
+use strict;
+use Getopt::Std;
+
+$Getopt::Std::STANDARD_HELP_VERSION = 1;
+sub VERSION_MESSAGE {}
+sub HELP_MESSAGE {
+die <<'EoUseMsg';
+Usage: mlocate-time [-a] [-N] /var/lib/mlocate/mlocate.db
+
+-a    Show file names from DB (default is just show directory entries)
+-N    Show nanosecond resolution timestamps 
+
+Timestamps are displayed in your default time zone.  "export TZ=<tzname>"
+to display in some other time zone.
+EoUseMsg
+}
+
+my %opts = ();
+getopts('aN', \%opts);
+my $show_files = $opts{'a'};
+my $show_nanosec = $opts{'N'};
+
+my $EODir = chr(2);
+my($data, $buffer);
+
+unless (open(INP, "< $ARGV[0]")) {
+    warn "Can't open $ARGV[0]: $!\n";
+    HELP_MESSAGE();
+}
+binmode(INP);
+sysread(INP, $data, 4096);   # pull initial data, including header
+
+# Get length of config block from header, then throw away header
+my $conf_block_len = unpack('N', substr($data, 8, 4));
+substr($data, 0, 16) = undef;
+
+# Read null-terminated root path of DB.  Then throw away path
+# and config block.  That should take us to the first directory entry.
+my $path = unpack('Z*', $data);
+substr($data, 0, length($path)+1+$conf_block_len) = undef;
+
+while (length($data)) {
+    # Make sure we've got at least one complete directory entry
+    # in our $data.  Using rindex() here to make sure we're not
+    # matching a 2 byte in the next directory header.
+    while (rindex($data, $EODir) < 18 && sysread(INP, $buffer, 4096)) {
+	$data .= $buffer;
+    }
+
+    # Reads directory header, then throws it away
+    my($high, $low, $nanosec, $pad, $dir) = unpack('N N N N Z*', $data);
+    substr($data, 0, length($dir)+17) = undef;
+
+    # Output directory name and timestamp
+    my($sec, $min, $hr, $day, $mon, $yr) = localtime(($high<<32) + $low);
+    $yr += 1900; $mon += 1;
+    my $stamp = sprintf("%d-%02d-%02d %02d:%02d:%02d",
+			$yr, $mon, $day, $hr, $min, $sec);
+    $stamp .= sprintf(".%09d", $nanosec) if ($show_nanosec);
+    print "$dir\t$stamp\n";
+    
+    # Read through file entries and output the regular files if desired.
+    # $data is reduced as we read each file entry.  Directories will be 
+    # output when we hit their directory entry so we can output the timestamp
+    # from the directory header.
+    $dir = undef if ($dir eq '/');
+    while (unpack('c', $data) != 2) {               # 2 byte marks end of dir
+        my ($type, $file) = unpack('c Z*', $data);
+	substr($data, 0, length($file)+2) = undef;
+	next if ($type == 1);                       # 1 means it's a directory
+	print "$dir/$file\n" if ($show_files);
+    }
+
+    # We're sitting on the end of directory marker. Throw it away.
+    substr($data, 0, 1) = undef;
+
+    # End of directory may have fallen exactly at the end of our buffer.
+    sysread(INP, $data, 4096) unless (length($data));
+}
+close(INP);
+
+##### PROGRAM ENDS
+
+# From mlocate.db(5) manual page:
+#
+#      A  mlocate database starts with a file header: 8 bytes for a magic num-
+#      ber ("\0mlocate" like a C literal), 4 bytes for the configuration block
+#      size  in big endian, 1 byte for file format version (0), 1 byte for the
+#      “require visibility” flag (0 or 1), 2 bytes padding, and  a  NUL-termi-
+#      nated path name of the root of the database.
+#
+#      The  header  is  followed  by a configuration block, included to ensure
+#      databases are not reused if some  configuration  changes  could  affect
+#      their contents.  The size of the configuration block in bytes is stored
+#      in the file header...
+#
+#      The  rest  of  the  file until EOF describes directories and their con-
+#      tents.  Each directory starts with a header: 8 bytes for directory time
+#      (seconds)  in  big  endian, 4 bytes for directory time (nanoseconds) in
+#      big endian (0 if unknown, less than 1,000,000,000),  4  bytes  padding,
+#      and  a  NUL-terminated  path name of the the directory.  Directory con-
+#      tents, a sequence of file entries sorted by name, follow.
+#
+#      Directory time is the maximum of st_ctime and st_mtime  of  the  direc-
+#      tory.   updatedb(8) uses the original data if the directory time in the
+#      database and in the file system match exactly.  Directory time equal to
+#      0  always causes rescanning of the directory: this is necessary to han-
+#      dle directories which were being updated while building the database.
+#
+#      Each file entry starts with a single byte, marking its type:
+#
+#      0      A non-directory file.  Followed by a  NUL-terminated  file  (not
+#             path) name.
+#
+#      1      A  subdirectory.   Followed  by a NUL-terminated file (not path)
+#             name.
+#
+#      2      Marks the end of the current directory.

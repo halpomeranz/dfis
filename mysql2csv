@@ -1,0 +1,203 @@
+#!/usr/bin/perl
+#
+# mysql2csv - Dumps one or more table(space)s to CSV files
+#
+# See HELP_MESSAGE() or "mysql2csv --help" for usage.
+#
+# Author: Hal Pomeranz (hal@deer-run.com)
+# License: Creative Commons Attribution Share Alike
+# Warranty: No warranty expressed or implied
+
+use strict;
+use DBI;
+use Getopt::Std;
+
+$Getopt::Std::STANDARD_HELP_VERSION = 1;
+sub VERSION_MESSAGE {}
+sub HELP_MESSAGE { 
+    die "$0: [-A] [-c charset] [-D database [-T table]] [-h host[:port]] 
+             [-u user] [-p [password]]
+    -A               Also dump contents of 'mysql' and 'information_schema'
+    -c               Specify character encoding (e.g. UTF8, cp1251)
+    -D database      Dump only the specified database
+    -T table         Dump only the specified table (-D must also be set)
+    -h host[:port]   Connect to database on specified host (port is optional)
+    -u user          Connect as the specified user (default is 'root')
+    -p [password]    Use password, prompt if not specified on command line
+                     (NOTE: use -p as final argument or \"-p ''\" for prompting)
+
+EXAMPLES:
+
+   mysql2csv                     # dumps all DBs on local machine 
+   mysql2csv -D mydb             # dump only tables from 'mydb'
+   mysql2csv -D mydb -T accts    # dump 'accts' table from 'mydb'
+   mysql2csv -h dbserv           # dumps all DBs found on server dbserv
+   mysql2csv -h dbserv:12345     # ... DB listening on alternate port number
+   mysql2csv -u fred -p          # dump as user 'fred', prompt for password
+   mysql2csv -u mary -p badidea  # specify password on command line
+
+Data is dumped to files named <dbname>-<table>.csv in current directory\n";
+}
+         
+my $dbh;
+my $Charset = undef;
+my $DBName = undef;
+my $Table = undef;
+my $Host = 'localhost';
+my $Port = undef;
+my $User = 'root';
+my $Password = undef;
+my $Prompt_Password = 0;
+my $Skip_Admin = 1;
+
+my %opts = ();
+getopts('Ac:D:h:p:T:u:', \%opts);
+foreach my $opt (keys(%opts)) {
+    if ($opt eq 'A')    { $Skip_Admin = 0; }
+    elsif ($opt eq 'c') { $Charset = $opts{'c'}; }
+    elsif ($opt eq 'D') { $DBName = $opts{'D'}; }
+    elsif ($opt eq 'h') { 
+	HELP_MESSAGE() unless (length($opts{'h'}));
+	($Host, $Port) = split(':', $opts{'h'}); 
+    }
+    elsif ($opt eq 'p') {
+	if (length($opts{'p'})) {
+	    $Password = $opts{'p'};
+	}
+	else {
+	    $Prompt_Password = 1;
+	}
+    }
+    elsif ($opt eq 'T') { $Table = $opts{'T'}; }
+    elsif ($opt eq 'u') { $User = $opts{'u'}; }
+}
+
+# If you're going to specify a table name, you have to give me a DB name
+HELP_MESSAGE() if (length($Table) && !length($DBName));
+
+# Invoked with "-p" but null password means we prompt user
+if ($Prompt_Password) {
+    print STDERR "Password: ";
+    system('stty', '-echo');
+    chomp($Password = <STDIN>);
+    system('stty', 'echo');
+    print STDERR "\n";
+}
+
+my @dbs;
+if (length($DBName)) {
+    @dbs = ($DBName);
+}
+else {
+    # Connecting to the mysql DB and doing "show databases" here
+    # because DBI->data_sources() doesn't seem to work on remote DBs.
+    # This method may have some issues as well, but seems to be the
+    # best alternative...
+    #
+    $dbh = DBI->connect("dbi:mysql:database=mysql;host=$Host;port=$Port",
+			$User, $Password, {PrintError => 0}) ||
+	 die "Failed to connect to 'mysql' DB on $Host:$Port:\n$DBI::errstr\n";
+
+    my $dbs = $dbh->selectcol_arrayref("show databases");
+    if ($dbh->err) {
+	warn "Failed to get database names from $Host:$Port: " . $dbh->errstr . "\n";
+	return();
+    }
+    $dbh->disconnect();
+
+    # Filter out "administrative" databases unless "-A" is set
+    @dbs = grep(!/^(mysql|information_schema)$/, @{$dbs}) if ($Skip_Admin);
+}
+
+
+foreach my $db (@dbs) {
+    unless ($dbh = DBI->connect("dbi:mysql:database=$db;host=$Host;port=$Port",
+				$User, $Password, {PrintError => 0})) {
+	warn "Failed to connect to database $db ($Host:$Port):\n$DBI::errstr\n";
+	next;
+    }
+
+    if (defined($Charset)) {
+	$dbh->do("set names $Charset") || 
+	    die "Failed to set charset to $Charset: " . $dbh->errstr;
+    }
+
+    # Pull table names even if "-T" specified-- we'll need the table names
+    # to validate the "-T" input anyway
+    #
+    my $tblist = $dbh->selectcol_arrayref('show tables');
+    die "Failed to get table names from database $db ($Host:$Port):\n" . $dbh->errstr . "\n" if ($dbh->err);
+
+    # If "-T" then validate the table name, dump the table, and exit program
+    # (if "-T" then "-D" must have been used to specify a single DB name).
+    # Otherwise dump all tables in this DB-- outer loop will take care of
+    # doing this for all DBs.
+    #
+    if (length($Table)) {
+	die "Unrecognized table name '$Table' in database $db ($Host:$Port)\n"
+	    unless (grep(/^$Table$/, @{$tblist}));
+	dump_table($dbh, $db, $Table);
+	exit(0);
+    }
+    else {
+	foreach my $tbl (@{$tblist}) {
+	    dump_table($dbh, $db, $tbl);
+	}
+    }
+    $dbh->disconnect();
+}
+
+##########
+# Program ends, only subroutines below
+##########
+
+
+# Dumps specified table to file called "<dbname>-<table>.csv".
+# Returns 1 on success and undef on error.
+#
+sub dump_table {
+    my($dbh, $dbname, $tbl) = @_;
+
+    unless (open(OUTPUT, "> $dbname-$tbl.csv")) {
+	warn "Cannot write to $dbname-$tbl.csv: $!\n";
+	return();
+    }
+
+    # Is there a better way to get column names in canonical order?
+    #
+    my $cols = $dbh->selectcol_arrayref("describe $tbl");
+    if ($dbh->err) {
+	warn "Failed to get column names for $dbname.$tbl: " . $dbh->errstr . "\n";
+	return();
+    }
+    print OUTPUT '"', join('","', @{$cols}), "\"\r\n";
+    my $first = shift(@{$cols});
+
+
+    # Doing prepare/execute/fetch here because table size is unknown.
+    # Don't want to bloat out memory on huge tables.
+    #
+    my $sth = $dbh->prepare("select * from $tbl");
+    if ($dbh->err) {
+	warn "Failed to prepare statement to select data from $dbname.$tbl: " . $dbh->errstr . "\n";
+	return();
+    }
+
+    unless ($sth->execute()) {
+	warn "Failed to execute statement to select data from $dbname.$tbl: " . $dbh->errstr . "\n";
+	return();
+    }
+	
+    while (my $ref = $sth->fetchrow_hashref()) {
+	$$ref{$first} =~ s/"/""/g;             # Escape double quotes
+	print OUTPUT "\"$$ref{$first}\"";
+	foreach my $key (@{$cols}) {
+	    $$ref{$key} =~ s/"/""/g;           # Escape double quotes
+	    print OUTPUT ",\"$$ref{$key}\"";
+	}
+	print OUTPUT "\r\n";
+    }
+    $sth->finish;
+    close(OUTPUT);
+    return(1);
+}

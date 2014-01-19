@@ -1,0 +1,44 @@
+#!/usr/bin/perl
+#
+# xbel2csv: Create a CSV report from the Linux nautilus file browser's
+#           recently-used.xbel data file
+#
+# Hal Pomeranz, hal@deer-run.com
+
+use strict;
+
+my($path, $added, $modified, $visited, $mime_type, @app_list) = ();
+
+print '"Filename","Application(s) used to open","MIME type","File last visited","Entry added","Entry modified"' . "\r\n";
+
+while (<>) {
+    if (m|</bookmark>|) {
+	if (length($path)) {
+	    print '"', 
+	          join('","', $path, join("\n", @app_list),
+		              $mime_type, $visited, $added, $modified),
+	          "\"\r\n";
+	}
+	
+	($path, $added, $modified, $visited, $mime_type, @app_list) = ();
+    }
+    elsif (m|<bookmark href="file://|) {
+	($path, $added, $modified, $visited) = m|file://([^"]+)"\s+added="([^"]+)"\s+modified="([^"]+)"\s+visited="([^"]+)"|;
+	
+	$path =~ s/%(..)/chr(hex($1))/ge;
+	$added =~ s/T/ /; $added =~ s/Z/ UTC/;
+	$modified =~ s/T/ /; $modified =~ s/Z/ UTC/;
+	$visited =~ s/T/ /; $visited =~ s/Z/ UTC/;
+    }
+    elsif (m|mime:mime-type type=|) {
+	($mime_type) = m|mime:mime-type type="([^"]+)"|;
+    }
+    elsif (m|bookmark:application name=|) {
+	my($app_name, $app_exe, $app_mod, $app_ct) = m|bookmark:application name="([^"]+)"\s+exec="([^"]+)"\s+modified="([^"]+)"\s+count="([^"]+)"|;
+	
+	$app_exe =~ s/\&apos\;/'/g;
+	$app_mod =~ s/T/ /; $app_mod =~ s/Z/ UTC/;
+	
+	push(@app_list, "$app_name: $app_exe (count=$app_ct, last modified=$app_mod)");
+    }
+}

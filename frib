@@ -1,0 +1,449 @@
+#!/usr/bin/perl
+#
+# frib -- File Recovery via Indirect Blocks
+#
+# Requires blkcat utility from The Sleuthkit (www.sleuthkit.org)
+# Be sure to set $BLKCAT variable below to the appropriate path name if
+# the blkcat executable is not in your default search path.
+#
+# NOTE: Assumes little-endian byte order by default.  If you're using
+# this on a big-endian machine, use the -B option.  No testing has been
+# done with this option, however.
+#
+# Hal Pomeranz (hal.pomeranz@mandiant.com), 2012-08-21
+#
+
+use strict;
+use vars qw($opt_B $opt_d $opt_f $opt_F $opt_I $opt_L $opt_o $opt_t);
+use Getopt::Std;
+$Getopt::Std::STANDARD_HELP_VERSION = 1;    # Terminate after --help
+
+my $BLKCAT = 'blkcat';
+my ($i, $blk, $tuple) = ();
+
+sub HELP_MESSAGE { 
+    die <<"EoUseMsg";
+Usage: $0 [-dBfFt] [-I [file|-]] [-L 2|3] [-o offset] device block
+
+-d         Print debugging output
+-B         Use big-endian byte ordering
+-t         Trim nulls from end of trailing block (good for text files)
+-o offset  Sector offset in disk image (passed to Sleuthkit tools)
+
+-f         Force program to continue, even when processing blocks that
+              do not match the signature for indirect blocks
+-F         Dealing with a fragment or file with overwritten indirect
+              blocks.  File will be recovered in chunks and written to files.
+-I file|-  <block> argument is address of first indirect block.
+           Prior 12 blocks will be written to <file> or streamed to
+           stdout with rest of recovered file if "-" is selected.
+-L 2|3     <block> argument is the address of a double (2) or
+           treble (3) indirect block.  Blocks in chain will be recovered
+           from this point.
+<device>   Name of device-- anything readable by the Sleuthkit
+<block>    Starting block of file or first indirect block if "-I"
+EoUseMsg
+}
+
+getopts('dBfFI:L:o:t') || HELP_MESSAGE();
+my $Debug = $opt_d;
+my $Force = $opt_f;
+my $Fragment= $opt_F;
+my $Big_Endian = $opt_B;
+my $Indirect = $opt_I;
+my $Level = $opt_L;
+my $Trim_Nulls = $opt_t;
+my $device = shift(@ARGV);
+my $block = shift(@ARGV);
+my $Orig_Block = $block;
+die "Cannot read device $device\n" unless (-r $device);
+HELP_MESSAGE() unless (length($block));
+
+# $Force means interpret broken blocks.  Doesn't make sense with $Fragment
+warn "Both -f and -F specified.  Ignoring -f\n";
+$Force = 0 if ($Fragment);    
+
+$BLKCAT .= " -o $opt_o" if ($opt_o);
+if ($Level && $Indirect) {
+    warn "Cannot use -I with -L\n";
+    HELP_MESSAGE();      # terminates program
+}
+
+my $double_indirect = 0;
+my $treble_indirect = 0;
+if ($Level == 2) {
+    $double_indirect = $block;
+    goto recover_double;
+}
+elsif ($Level == 3) {
+    $treble_indirect = $block;
+    goto recover_treble;
+}
+
+# We'll treat these blocks specially when we get to the output section.
+# For now, we'll cheat and make it look like the case where the program
+# was invoked without -I.
+#
+if (length($Indirect)) {
+    $block = $block - 12;
+}
+
+# Push direct block addrs into block address list
+my @addrs = ();
+for ($i = 0; $i < 12; $i++) { 
+    $blk = $block + $i;
+    print STDERR "Adding hypothetical direct block address $blk\n" if ($Debug);
+    push(@addrs, $blk);
+}
+
+# This works whether -I was specified or not...
+my $first_indirect = $block + 12;
+
+if (length($Indirect)) {
+    print STDERR "First indirect block given as $first_indirect\nAlso capturing 12 blocks starting at $block\n" if ($Debug);
+}
+else {
+    print STDERR "Initial block is $block\nFirst indirect block should be $first_indirect\n" if ($Debug);
+}
+
+# Deal with first indirect block.  Note that the program just assumes that
+# the file we're dealing with is larger than 48K and thus will have at least
+# on indirect block.  If this is not the case, or if there's fragmentation
+# in the first 13 blocks so that the first indirect block is not where
+# it's expected, then dump_indirect_block() will abort the program because
+# the initial four bytes of the block will most likely not decode to the
+# expected value (-f option will force program to work through this).
+#
+print STDERR "Dumping first indirect block $first_indirect...\n" if ($Debug);
+push(@addrs, 
+     dump_indirect_block($device, $first_indirect, 0));
+
+
+# If last block pointer in the first indirect block is null then just
+# jump to the output code.  Otherwise we're going to fall through and
+# test for a double indirect chain. 
+#
+# Note that there is a potential for problems here.  If our file consumes
+# exactly 1036 data blocks, then we're not going to have a null block pointer
+# at the end of the first indirect block.  So we'll test for a double indirect
+# block chain that doesn't exist.  This will cause dump_indirect_block() to
+# bomb out the program (-F will work around this).
+#
+if ($addrs[$#addrs]) {
+    $double_indirect = $addrs[$#addrs] + 1;
+    print STDERR "Last block address is $addrs[$#addrs]\nChecking for double indirect at $double_indirect\n" if ($Debug);
+}
+else {
+    print STDERR "Last block address is NULL, we're done!\n" if ($Debug);
+    goto dump_file_content;
+}
+
+# Note that dump_indirect_block() will recursively unwind the whole
+# double indirect block chain here...
+#
+recover_double:
+
+print STDERR "Dumping double indirect block $double_indirect\n" if ($Debug);
+push(@addrs, 
+     dump_indirect_block($device, $double_indirect, 1));
+
+if ($Level) {
+    warn "Last data block is $addrs[-1]-- look at " . ($addrs[-1] + 1) . " as possible indirect block\n" if ($addrs[-1]);
+    goto dump_file_content;
+}
+
+# Once again we check to see if the final block address returned was null.
+# If so, then jump to the output code.  Otherwise fall through and try to
+# extract the treble indirect chain.
+#
+if ($addrs[$#addrs] && ($addrs[$#addrs] ne 'X')) {
+    $treble_indirect = $addrs[$#addrs] + 1;
+    print STDERR "Last block address is $addrs[$#addrs]\nChecking for treble indirect at $treble_indirect\n" if ($Debug);
+}
+else {
+    if ($Debug) {
+	if ($addrs[$#addrs]) {    # last entry is 'X'
+	    print STDERR "Trailing blocks lost. Dumping what we've got!\n";
+	}
+	else {
+	    print STDERR "Last block address is NULL, we're done!\n";
+	}
+    }
+    goto dump_file_content;
+}
+
+recover_treble:
+
+print STDERR "Dumping treble indirect block $treble_indirect\n" if ($Debug);
+push(@addrs, 
+     dump_indirect_block($device, $treble_indirect, 2));
+
+
+# Done decoding block chains.  Output routines below this point.
+dump_file_content:
+
+
+# Final sanity check. Handle last block specially if -t option was set
+my $final_addr = undef;
+if ($addrs[$#addrs] eq 'X') {
+    # Throw away all trailing 'X'. That way if we only have one chunk
+    # of recovered data it will be treated normally rather than creating
+    # a single chunked file.
+    #
+    while ($addrs[$#addrs] eq 'X') { pop(@addrs); };
+    print STDERR "Cleaning up lost trailing block markers before output\n"
+	if ($Debug);
+}
+elsif ($addrs[$#addrs]) {
+    die "Last block address is $addrs[$#addrs] but should be NULL\nUse -f/-F to ignore this\n" unless ($Force || $Fragment);
+    print STDERR "Ignoring non-NULL final block address ($addrs[$#addrs])\n"
+	if ($Debug);
+}
+else {
+    # Throw away trailing null block pointer returned by dump_indirect_block()
+    pop(@addrs);
+    print STDERR "Discarding end of chain NULL marker\n" if ($Debug);
+}
+$final_addr = pop(@addrs) if ($Trim_Nulls);
+
+
+# Need to figure out if we're going to be dumping chunk files before
+# we hit the next block of code for handling the direct blocks.
+# That way, we can put the direct blocks into file "<$file_base>.000".
+#
+my $file_base = undef;
+my $Chunked_Output = grep($_ eq 'X', @addrs);
+if ($Chunked_Output) {
+    $file_base = "$device-$Orig_Block";
+    $file_base =~ s|.*/||;
+    $file_base =~ s|\s+|_|g;
+}
+
+
+# If -I option was set, then first 12 data blocks may or may not be part
+# of our file.  Send these blocks to the filename given after the -I arg.
+# "-I -" means send these blocks to stdout so they'll be contiguous with
+# the rest of the file content we'll be spitting out.
+#
+# If we're dealing with chunked output, ignore the -I filename argument
+# and put the first 12 blocks in "<$file_base>.000" so things are consistent.
+#
+if (length($Indirect)) {
+    $blk = shift(@addrs);     # grab first block address
+    splice(@addrs, 0, 11);    # get rid of next 11 block addresses
+
+    # Send output to appropriate place using select() if "-I <filename>"
+    $Indirect = "$file_base.000" if ($Chunked_Output);
+    unless ($Indirect eq '-') {
+	open(OUTPUT, "> $Indirect") || 
+	    die "Failed to open output file $Indirect: $!\n";
+	select(OUTPUT);
+    }
+
+    # Call blkcat and dump output to select()ed file handle or stdout
+    print STDERR "Dumping initial 12 blocks starting at $blk\n" if ($Debug);
+    open(BLKCAT, "$BLKCAT $device $blk 12 |") || 
+	die "Failed to execute '$BLKCAT $device $blk 12': $!\n";
+    while (<BLKCAT>) { print; }
+    close(BLKCAT);
+
+    # These are no-ops if "-I -"
+    select STDOUT;
+    close(OUTPUT);
+}
+
+
+# Now that we've peeled off the 12 blocks added artificially by -I,
+# we're ready to deal with the indirect block chain.  Initialize
+# %chunk_start which will track the first block after each collection
+# of lost blocks.  This will be a trigger to start a new
+# <$file_base>.nnn file.
+#
+# Throw away leading 'X's in list so @addrs starts with a real block
+# number for the loop below.
+#
+my %chunk_start = ();
+while (@addrs && ($addrs[0] eq 'X')) { shift(@addrs); }
+$chunk_start{$addrs[0]} = 1;
+
+
+# It's really inefficient to output one block at a time, so try and 
+# convert our list of block addresses into a series of extents:
+# "(starting block):(number of contiguous blocks)".
+#
+# While we're doing this, update %chunk_start to track where lost
+# blocks breaks occur.
+#
+my @full_list = (@addrs);
+my $prev_addr = shift(@full_list);
+my $run_start = $prev_addr;
+my $blkct = 1;
+@addrs = ();
+while (@full_list) {
+    my $curr = shift(@full_list);
+    if ($curr == ($prev_addr + 1)) {
+	$blkct += 1;
+    }
+    else {
+	print STDERR "Found run of $blkct blocks starting at $run_start\n"
+	    if ($Debug);
+	push(@addrs, "$run_start:$blkct");
+	if ($curr eq 'X') {
+	    print STDERR "Hit a chunk of missing blocks\n" if ($Debug);
+	    while ($curr eq 'X') {   # trailing X's removed from @addrs above
+		$curr = shift(@full_list);
+	    }
+	    $chunk_start{$curr} = 1;
+	}
+	$run_start = $curr;
+	$blkct = 1;
+    }
+    $prev_addr = $curr;
+}
+print STDERR "Pushing final run of $blkct blocks starting at $run_start\n"
+    if ($Debug);
+push(@addrs, "$run_start:$blkct");
+
+
+# Now dump each extent.  STDOUT is default unless we're chunking.
+my $chunk = 1;
+foreach $tuple (@addrs) {
+    ($blk, $blkct) = split(/:/, $tuple);
+    print STDERR "Dumping $blkct blocks starting at $blk\n" if ($Debug);
+    if ($chunk_start{$blk}) {
+	my $outfile = sprintf("$file_base.%03d", $chunk++);
+	print STDERR "Starting new chunk file $outfile\n" if ($Debug);
+	close(OUTPUT);
+	open(OUTPUT, "> $outfile") || die "Can't write $outfile: $!\n";
+	select(OUTPUT);
+    }
+    open(INP, "$BLKCAT $device $blk $blkct |") ||
+	die "'$BLKCAT $device $blk $blkct' failed: $!\n";
+    print <INP>;
+    close(INP);
+}
+
+
+# Finally, if -t option was set then suck in final block, trim off all
+# nulls at the end of the block, and spit out the cleaned up block to 
+# the select()ed file handle (stdout by default).
+#
+if ($Trim_Nulls) {
+    print STDERR "Trimming trailing nulls from final block $final_addr\n" 
+	if ($Debug);
+    open(BLKCAT, "$BLKCAT $device $final_addr |") ||
+	die "Failed to run '$BLKCAT -h $device $final_addr': $!\n";
+    my @lines = <BLKCAT>;
+    close(BLKCAT);
+    $lines[$#lines] =~ s/\000+$//;
+    print @lines;
+}
+
+##### PROGRAM ENDS.  Subroutines only below this point.
+
+# INPUTS: $device       device or image target
+#         $block        address of suspected indirect block
+#         $indirection  0 if single indirect, 1 if double, 2 if treble
+#
+# Also references: $Debug        print debugging output
+#                  $Force        don't abort on errors
+#                  $Fragment     tolerate trampled indirect block data
+#                  $Big_Endian   use big-endian byte ordering
+#
+# RETURNS: List of data block addresses. Last entry is zero if end of 
+#          chain has been found.
+#
+sub dump_indirect_block {
+    my($device, $block, $indirection) = @_;
+    my($idb, $a, @addrs) = ();
+
+    # Used for pretty-printing debug output
+    my $pref_str = '+' x (3 - $indirection) . "($indirection)";
+
+    # Run blkcat to dump $block.  Put list of decoded addresses into
+    # @addrs.  Stop when we hit a null address, indicating the end of
+    # the chain (though we push null address as last elt of @addrs)
+    #
+    open(BLKCAT, "$BLKCAT -h $device $block |") ||
+	die "Failed to run '$BLKCAT -h $device $block': $!\n";
+
+    ADDR: while (<BLKCAT>) {
+	my @pieces = (split(' '))[1,2,3,4];
+	foreach $a (@pieces) {
+	    $a =~ s/(\w\w)(\w\w)(\w\w)(\w\w)/$4$3$2$1/ unless ($Big_Endian);
+	    my $val = hex($a);
+	    print STDERR "$pref_str Found address $val\n" if ($Debug);
+	    push(@addrs, $val);
+	    last ADDR unless ($val);
+	}
+    }
+    close(BLKCAT);
+
+    # Sanity check
+    if ($addrs[0] == ($block + 1)) {
+	print STDERR "$pref_str First address in indirect block is $addrs[0], as expected\n" if ($Debug);
+    }
+    else {
+	print STDERR "Unexpected initial block address $addrs[0]-- should be ($block + 1)\n" if ($Debug);
+	if ($Fragment) {
+	    print STDERR "Assuming block is damaged, skipping and returning 'X'\n" if ($Debug);
+	    return('X');
+	}
+	die "Aborting because block $block doesn't appear to be an indirect block.\nUse -f/-F option to overlook this issue\n" unless ($Force);
+    }
+
+    # $indirection is non-zero if we're dealing with a double or treble
+    # indirect chain.  Otherwise just return the block addrs we decoded.
+    #
+    return(@addrs) unless ($indirection);
+
+    # If we get here then we're dealing with a (suspected) double or treble
+    # indirect.  So the addresses we decoded above are the addresses of 
+    # indirect blocks.  We need to call dump_indirect_block() recursively
+    # on each of these block addresses, decrementing $indirect by 1.
+    # The returned addresses will be concatenated together in @addrs.
+    #
+    pop(@addrs) unless ($addrs[$#addrs]);
+    my $last_addr = $addrs[$#addrs];
+    my @indirect_blocks = @addrs;
+    @addrs = ();
+    $indirection = $indirection - 1;
+    foreach $idb (@indirect_blocks) {
+	print STDERR "$pref_str Dumping indirect block $idb...\n" if ($Debug);
+	my @newaddrs = dump_indirect_block($device, $idb, $indirection);
+
+	# Say block 1000 was the first indirect block in a treble indirect
+        # chain.  The address of the first data block would be 1003 because
+        # 1001 would be a double indirect block pointing to 1002 which was
+	# an indirect block.  Hence the ($idb + $indirection + 1) expression.
+	#
+	if ($newaddrs[0] == ($idb + $indirection + 1)) {
+	    print STDERR "$pref_str First address in indirect block is $newaddrs[0], as expected\n" if ($Debug);
+	}
+	elsif ($newaddrs[0] eq 'X') {
+	    print STDERR "Indirect block $idb appears to be damaged.  Hoping recovery can proceed\n" if ($Debug);
+	}
+	else {
+	    warn "Unexpected initial block address $newaddrs[0]-- should be ($idb + $indirection + 1)\n";
+	    die "Aborting because block $block doesn't appear to be an indirect block.\nUse -f option to overlook this issue\n" unless ($Force);
+	}
+	
+	# Unless we're dealing with the last block in the chain, there
+	# shouldn't be any null blocks found.
+	#
+	if (($idb != $last_addr) && !($newaddrs[$#newaddrs])) {
+	    if ($Fragment) {
+		print STDERR "Null address encountered in non-terminal block $idb.\nAssuming block is damaged, discarding data.\n";
+		@newaddrs = ('X');
+	    }
+	    # $Force can't help us here.  Give up.
+	    die "Null address encountered in block $idb-- this shouldn't happen!\n";
+	}
+
+	# Looks OK, add the blocks returned by dump_indirect_block() 
+	# to @addrs list
+	#
+	push(@addrs, @newaddrs);
+    }
+    return(@addrs);
+}
