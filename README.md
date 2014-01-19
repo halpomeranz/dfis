@@ -17,7 +17,9 @@ in and internal commentary in some cases.
 The original version of the frib/fib tools are documented here:
 
 https://www.mandiant.com/blog/ext3-file-recovery-indirect-blocks/
+
 http://www.deer-run.com/~hal/EXT3FileRecovery.pdf
+
 http://www.livestream.com/sansinstitute/video?clipId=pla_813f3343-b170-4671-ac73-fd186e7b400e&utm_source=lslibrary&utm_medium=ui-thumb
 
 There have been some updates to frib/fib since these presentations,
