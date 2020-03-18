@@ -1,0 +1,42 @@
+#!/usr/bin/perl
+#
+#     syslog2mactime [-y YYYY] /path/to/logfile >>/path/to/bodyfile
+#
+# YYYY is the year associated with the FIRST log entry being read
+# (defaults to current year). Will read from stdin if logfile not specified.
+#
+# Be sure to set timezone to timezone of image you're analyzing ("export TZ=...")!
+#
+
+use strict;
+use Getopt::Std;
+use Time::Local;
+
+my %monnum = ( 'Jan' => 0, 'Feb' => 1, 'Mar' => 2,  'Apr' => 3,
+	       'May' => 4, 'Jun' => 5, 'Jul' => 6,  'Aug' => 7,
+	       'Sep' => 8, 'Oct' => 9, 'Nov' => 10, 'Dec' => 11 );
+
+my(%opts);
+getopts('y:', \%opts);
+
+my $year;
+if (defined($opts{'y'})) { $year = $opts{'y'} - 1900; }
+else                     { $year = (localtime())[5]; }
+
+my $last_month = 0;
+while (<>) {
+    chomp;
+    my($mon, $day, $hr, $min, $sec, $message) = 
+	m#^([A-Z][a-z]+)\s+(\d+)\s+(\d+):(\d+):(\d+)\s+(.*)$#;
+    next unless (length($message));
+
+    my $mn = $monnum{$mon};
+    $year = ($year + 1) if ($mn < $last_month);
+    $last_month = $mn;
+    my $epoch_time = timelocal($sec, $min, $hr, $day, $mn, $year);
+
+    $message =~ s/\|/:/g;      # mactime format is pipe-delimited
+    
+    print join('|', 0, $message, 0, 'N/A         ', 0, 0, 0,
+	       $epoch_time, $epoch_time, $epoch_time, $epoch_time, 0), "\n";
+}

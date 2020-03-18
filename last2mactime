@@ -1,0 +1,71 @@
+#!/usr/bin/perl
+#
+# last -if /path/to/wtmp/file |
+#     last2mactime [-p /path/to/passwd/file] [-y YYYY] >>/path/to/bodyfile
+#
+# lastb -if /path/to/btmp/file |
+#     last2mactime -B [-p /path/to/passwd/file] [-y YYYY] >>/path/to/bodyfile
+#
+# YYYY is the year associated with the MOST RECENT wtmp entry (defaults to
+# current year).  Be sure to set timezone to timezone of image you're
+# analyzing ("export TZ=...").
+#
+
+use strict;
+use Getopt::Std;
+use Time::Local;
+
+my %monnum = ( 'Jan' => 0, 'Feb' => 1, 'Mar' => 2,  'Apr' => 3,
+	       'May' => 4, 'Jun' => 5, 'Jul' => 6,  'Aug' => 7,
+	       'Sep' => 8, 'Oct' => 9, 'Nov' => 10, 'Dec' => 11 );
+
+my(%opts);
+getopts('Bp:y:', \%opts);
+
+my $year;
+if (defined($opts{'y'})) { $year = $opts{'y'} - 1900; }
+else                     { $year = (localtime())[5]; }
+
+$opts{'p'} = '/etc/passwd' unless (defined($opts{'p'}));
+open(PWD, "< $opts{'p'}") || die "Can't open $opts{'p'}: $!\n";
+my(%uid);
+while (<PWD>) {
+    my($user, $uid) = (split(':'))[0,2];
+    $uid{$user} = $uid;
+}
+
+my $reading_btmp = defined($opts{'B'});
+
+my $last_month = 13;
+while (<>) {
+    my($user, $pty, $ip, $mon, $day, $hr, $min, $duration) =
+	m#^(\S+)\s+(.*?)\s+([0-9.]+)\s+\w+\s+(\w+)\s+(\d+)\s+(\d+):(\d+).*\(([^)]+)\)\s*$#;
+    next unless (length($duration));
+
+    my $mn = $monnum{$mon};
+    $year = ($year - 1) if ($mn > $last_month);
+    $last_month = $mn;
+    my $start_time = timelocal(0, $min, $hr, $day, $mn, $year);
+    
+    if ($pty eq 'system boot') {
+	print join('|', 0, 'SYSTEM BOOT', 0, 'N/A         ', 0, 0, 0,
+		   $start_time, $start_time, $start_time, $start_time, 0), "\n";
+    }
+    elsif ($reading_btmp) {
+	print join('|', 0, "=FAILED LOGIN: $user on $pty from $ip", 
+		   0, 'N/A         ', $uid{$user}, 0, 0,
+		   $start_time, $start_time, $start_time, $start_time, 0), "\n";
+    }
+    else {
+	my($d, $h, $m) = split(/[\+:]/, $duration);
+	unless (defined($m)) { $m = $h; $h = $d; $d = 0; }
+	my $end_time = $start_time + $d*86400 + $h*3600 + $m*60;
+
+	print join('|', 0, "-LOGIN: $user on $pty from $ip", 
+		   0, 'N/A         ', $uid{$user}, 0, 0,
+		   $start_time, $start_time, $start_time, $start_time, 0), "\n";
+	print join('|', 0, "#LOGOUT: $user on $pty from $ip", 
+		   0, 'N/A         ', $uid{$user}, 0, 0,
+		   $end_time, $end_time, $end_time, $end_time, 0), "\n";
+    }
+}
