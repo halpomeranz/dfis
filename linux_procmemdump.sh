@@ -6,9 +6,10 @@ usage() {
     cat <<"EOM"
 Dump process memory sections and extract ASCII strings from running processes
 
-Usage: $0 [-p pid] [-b] [-s] -d dumpdir
+Usage: $0 [-p pid] [-b] [-s] [-u] -d dumpdir
 
     -p pid   Dump only a single PID, rather than all PIDs (default)
+    -u       Put memory section data into "sections" subdir (for UAC output)
     -b       Encode memory sections by swapping bytes (protect from AV)
     -s       Output strings only, do not write out memory section data
 EOM
@@ -19,7 +20,8 @@ strings_only=0
 swap_bytes=0
 outputdir=''
 user_pid=''
-while getopts "bd:p:s" opts; do
+uac_path=''
+while getopts "bd:p:su" opts; do
     case ${opts} in
         b) swap_bytes=1
            ;;
@@ -28,6 +30,8 @@ while getopts "bd:p:s" opts; do
 	p) user_pid=${OPTARG}
 	   ;;
 	s) strings_only=1
+           ;;
+	u) uac_path='/sections'
            ;;
         *) usage
            ;;
@@ -39,7 +43,7 @@ done
 if [[ -n "$user_pid" ]]; then			# One user specified PID or all PIDS?
     input_files="/proc/$user_pid/maps"
 else
-    input_files=/proc/[0-9]*/maps
+    input_files="/proc/[0-9]*/maps"
 fi
 
 # Dumping both strings and memory sections is accomplished using a FIFO to split the output
@@ -53,14 +57,14 @@ fi
 
 # Loop over all processes
 for mapfile in $input_files; do
-    pid=$(echo $mapfile | cut -f3 -d/)
+    pid=$(echo "$mapfile" | cut -f3 -d/)
     [[ $pid -eq $$ ]] && continue		# Don't dump our own process
 
     thisoutput="$outputdir/$pid"		# Where the output for this process goes
-    mkdir -p "$thisoutput"
+    mkdir -p "$thisoutput$uac_path"
 
     # Process the regions for this process
-    cat $mapfile | sed 's/-/ /' | while read start end flags junk; do
+    cat "$mapfile" | sed 's/-/ /' | while read start end flags junk; do
 	[[ "$flags" =~ ^r ]] || continue	# Skip unreadable sections
 
         start_page=$((16#$start / 4096))	# convert byte offset to page offset
@@ -73,13 +77,13 @@ for mapfile in $input_files; do
 	# All data is gzip-ed to save space.
 	#
 	if [[ $strings_only -gt 0 ]]; then
-	    dd if=/proc/$pid/mem bs=4096 skip=$start_page count=$((16#$end / 4096 - $start_page))
+	    dd if="/proc/$pid/mem" bs=4096 skip=$start_page count=$((16#$end / 4096 - $start_page))
 	elif [[ $swap_bytes -gt 0 ]]; then
-	    dd if="$fifo_path" conv=swab | gzip >"$thisoutput/$start-$end.mem.swab.gz" &
-	    dd if=/proc/$pid/mem bs=4096 skip=$start_page count=$((16#$end / 4096 - $start_page)) | tee "$fifo_path"
+	    dd if="$fifo_path" conv=swab | gzip >"$thisoutput$uac_path/$start-$end.mem.swab.gz" &
+	    dd if="/proc/$pid/mem" bs=4096 skip=$start_page count=$((16#$end / 4096 - $start_page)) | tee "$fifo_path"
 	else
-	    cat "$fifo_path" | gzip >"$thisoutput/$start-$end.mem.gz" &
-	    dd if=/proc/$pid/mem bs=4096 skip=$start_page count=$((16#$end / 4096 - $start_page)) | tee "$fifo_path"
+	    cat "$fifo_path" | gzip >"$thisoutput$uac_path/$start-$end.mem.gz" &
+	    dd if="/proc/$pid/mem" bs=4096 skip=$start_page count=$((16#$end / 4096 - $start_page)) | tee "$fifo_path"
 	fi
     done 2>/dev/null | strings -a | gzip >"$thisoutput/memory_strings.txt.gz"
 done
