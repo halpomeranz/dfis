@@ -3,7 +3,7 @@
 # Distributed under the Creative Commons Attribution-ShareAlike 4.0 license (CC BY-SA 4.0)
 
 usage() {
-    cat <<"EOM"
+    cat <<EOM
 Dump process memory sections and extract ASCII strings from running processes
 
 Usage: $0 [-p pid] [-b] [-s] [-u] -d dumpdir
