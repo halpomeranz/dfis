@@ -34,9 +34,9 @@ Inode=$2
 [[ -z "$Inode" ]] && usage
 
 # We need the file system block size and the number of blocks per AG in order to create "dd" commands
-eval $(xfs_db -r -c 'sb 0' -c 'print agblocks' $Device | tr -d ' ')
+agblocks=$(xfs_db -r -c 'sb 0' -c 'print agblocks' $Device | sed 's/.*= //')
 [[ $Debug -gt 0 ]] && echo "Blocks per AG: $agblocks"
-eval $(xfs_db -r -c 'sb 0' -c 'print blocksize' $Device | tr -d ' ')
+blocksize=$(xfs_db -r -c 'sb 0' -c 'print blocksize' $Device | sed 's/.*= //')
 [[ $Debug -gt 0 ]] && echo "Block size: $blocksize"
 
 # Create a hex dump of the requested inode using xfs_db
