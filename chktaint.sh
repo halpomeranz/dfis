@@ -3,6 +3,9 @@
 # Distributed under the Creative Commons Attribution-ShareAlike 4.0 license (CC BY-SA 4.0)
 #
 # Tool to interpret the value in /proc/sys/kernel/tainted
+#
+# Usage: chktaint.sh [ path | value ]        (default with no arg is to run against live /proc/sys/kernel/tainted)
+#
 # Inspired by https://docs.kernel.org/admin-guide/tainted-kernels.html#decoding-tainted-state-at-runtime
 
 TaintMessage=(
@@ -27,7 +30,13 @@ TaintMessage=(
 'an in-kernel test has been run'
 )
 
-TaintVal=$(cat /proc/sys/kernel/tainted)
+TaintVal=$1
+if [[ -z $TaintVal ]]; then
+    TaintVal=$(cat /proc/sys/kernel/tainted)
+elif [[ ! "$TaintVal" =~ ^[0-9]+$ ]]; then
+    TaintVal=$(cat "$TaintVal")
+fi
+
 for i in {0..18}; do 
     [[ $(($TaintVal>>$i & 1)) -eq 1 ]] && echo ${TaintMessage[$i]}
 done
