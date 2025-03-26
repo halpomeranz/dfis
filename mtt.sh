@@ -1,5 +1,5 @@
 #!/bin/bash
-# Hal Pomeranz (hrpomeranz@gmail.com) -- 2025-03-24
+# Hal Pomeranz (hrpomeranz@gmail.com) -- 2025-03-26
 # Distributed under the Creative Commons Attribution-ShareAlike 4.0 license (CC BY-SA 4.0)
 
 usage() {
@@ -253,7 +253,7 @@ if [[ "$curr_data" =~ DOS/MBR ]]; then
 	else                                    # We have to mount partitions until we find the fstab file
 	    [[ $Debug -gt 0 ]] && echo +++++ Root device cannot be inferred. Doing this the hard way.
 	    mv "$CmdFile" "$CmdFile.sav"
-	    for device in ${fs_type[@]}; do
+	    for device in ${!fs_type[@]}; do
 		mount_device $device "$TargetDir/files" "${fs_type[$device]}"
 		if [[ -f "$TargetDir/files/etc/fstab" ]]; then
 		    [[ $Debug -gt 0 ]] && echo +++++ $device is root device
