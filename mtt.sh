@@ -1,6 +1,7 @@
 #!/bin/bash
 # Hal Pomeranz (hrpomeranz@gmail.com) -- 2025-03-26
 # Distributed under the Creative Commons Attribution-ShareAlike 4.0 license (CC BY-SA 4.0)
+# Version: 1.1.0
 
 usage() {
     cat <<EOM
@@ -214,9 +215,20 @@ if [[ "$curr_data" =~ DOS/MBR ]]; then
 
 	# Deal with LVM volumes
 	if [[ "$ptype" =~ LVM2 ]]; then
+	    # Get the volume group name
+	    vgname=$(pvdisplay -c $part 2>/dev/null | cut -f2 -d:)
+
+	    # Are we dealing with a duplicate volume name? Bail!
+	    if [[ $(vgdisplay -c 2>/dev/null | cut -f1 -d: | grep -F "$vgname" | wc -l) -gt 1 ]]; then
+		echo \*\*\* MAJOR ISSUE\!
+		echo \*\*\* Looks like there is already a volume group with the name \"$vgname\" mounted here.
+		echo \*\*\* We cannot mount this image until the other image is unmounted. Sorry\!
+		losetup -d $loop_device
+		UnmountDir=$TargetDir
+		do_unmount                # do_unmount() exits the program
+	    fi
 
 	    # Need to activate the volume group ("vgchange -a y")
-	    vgname=$(pvdisplay -c $part | cut -f2 -d:)
 	    vgchange -a y $vgname >/dev/null 2>&1
 	    echo -e vgchange -a y $vgname\\n >>"$CmdFile"
 
