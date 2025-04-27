@@ -1,0 +1,34 @@
+#!/usr/bin/perl
+# mgrep -- match patterns and output messages from Unix mailbox files
+# Usage: mgrep [-i] [-f file] [pattern] file1 ...
+
+use strict;
+use Getopt::Std;
+
+my %opts = ();
+getopts('if:', \%opts);
+
+my $pattern = undef;
+if (length($opts{'f'})) {
+    open(FILE, "< $opts{'f'}") ||
+	die "Can't open pattern file $opts{'f'}: $!\n";
+    my @lines = <FILE>;
+    close(FILE);
+    chomp(@lines);
+    $pattern = '(' . join('|', @lines) . ')';
+}
+else {
+    $pattern = shift(@ARGV);
+}
+$pattern = "(?i)$pattern" if ($opts{'i'});
+
+my $message = undef;
+while (<>) {
+    if (/^From\s/) {
+	print $message if ($message =~ /$pattern/s);
+	$message = undef;
+    }
+    $message .= $_;
+}
+print $message if ($message =~ /$pattern/s);
+
