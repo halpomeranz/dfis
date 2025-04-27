@@ -1,7 +1,7 @@
 #!/bin/bash
-# Hal Pomeranz (hrpomeranz@gmail.com) -- 2025-03-26
+# Hal Pomeranz (hrpomeranz@gmail.com) -- 2025-04-27
 # Distributed under the Creative Commons Attribution-ShareAlike 4.0 license (CC BY-SA 4.0)
-# Version: 1.1.0
+# Version: 1.2.0
 
 usage() {
     cat <<EOM
@@ -22,8 +22,8 @@ EOM
     exit 1;
 }
 
-# Unmounts everything, including deactivating volume groups and detatching loopback devices
-# Ends program when finished
+# Unmounts everything, including deactivating volume groups and detatching
+# loopback devices. Ends program when finished.
 #
 do_unmount() {
     declare -A found_vgs
@@ -41,11 +41,19 @@ do_unmount() {
 	    [[ $Debug -gt 0 ]] && echo +++++ loop device $maindev
 	fi
 
-	# Is this device part of a volume group? Capture all unique volume group names
+	# Is this device part of a volume group?
+	# Capture all unique volume group names
 	vgname=$(lvdisplay -c $dev 2>/dev/null | cut -f2 -d:)
 	if [[ -n $vgname ]]; then
 	    found_vgs[$vgname]=1
 	    [[ $Debug -gt 0 ]] && echo +++++ volume group name $vgname
+
+	    ldev=$(pvdisplay -c 2>/dev/null | awk -F: "/$vgname/ {print \$1}")
+	    if [[ $ldev =~ /dev/loop ]]; then
+		ldev=$(echo $ldev | sed 's,\(/dev/loop[0-9]*\)p[0-9]*,\1,')
+		loop_devs[$ldev]=1
+		[[ $Debug -gt 0 ]] && echo +++++ loop device $ldev
+	    fi
 	fi
     done< <(df --output=source,target | grep -F "$UnmountDir" | sort -b -k2,2 -r)
 
@@ -106,7 +114,7 @@ mount_device() {
 }
 
 
-############# Program starts here ##############################################
+############# Program starts here ###########################################
 
 TargetDir='mount'
 Debug=0
@@ -156,7 +164,8 @@ if [[ ! -d "$TargetDir" ]]; then
     mkdir -p "$TargetDir" || usage
 fi
 
-# We will manually write a copy of all commands used to mount the image to this file
+# We will manually write a copy of all commands used to mount the image
+# to this file
 CmdFile="$TargetDir/MOUNTING"
 cp /dev/null "$CmdFile"
 mkdir -p "$TargetDir/files"
@@ -165,9 +174,24 @@ echo mkdir -p \"$TargetDir/files\" >>"$CmdFile"
 
 # OK, time to start mounthing things!
 #
-# Step 1 -- Is this an E01? If so, call ewfmount
 curr_image="$Image"
-curr_data=$(file -Ls "$Image")
+curr_data=$(file -Ls "$curr_image")
+
+# Step 1a -- Is this a (compressed) VMDK or other virtual disk? Try qemu-img
+if [[ "$curr_data" =~ VMware.*disk ]]; then
+    echo Creating \"$Image.raw\"
+    qemu-img convert "$Image" "$Image.raw"
+
+    if [[ ! -f "$Image.raw" ]]; then
+	echo Failed to make \"$Image.raw\", aborting
+	exit 255
+    fi
+    
+    curr_image="$Image.raw"
+    curr_data=$(file -Ls "$curr_image")
+fi
+
+# Step 1b -- Is this an E01? If so, call ewfmount
 if [[ "$curr_data" =~ EWF ]]; then
     mkdir -p "$TargetDir/img"
     im_dir=$(dirname "$curr_image")
@@ -188,7 +212,7 @@ mkdir -p "$TargetDir/img"
 EOM
     # Next step will look at the ewf1 raw image
     curr_image="$TargetDir/img/ewf1"
-    curr_data=$(file -Ls "$TargetDir/img/ewf1")
+    curr_data=$(file -Ls "$curr_image")
 fi
 
 
@@ -232,8 +256,9 @@ if [[ "$curr_data" =~ DOS/MBR ]]; then
 	    vgchange -a y $vgname >/dev/null 2>&1
 	    echo -e vgchange -a y $vgname\\n >>"$CmdFile"
 
-	    # Now look at each device in the volume group and save the "file" output into an associative array
-	    for device in $(lvdisplay -c $vgname | cut -f1 -d:); do
+	    # Now look at each device in the volume group and save the
+	    # "file" output into an associative array
+	    for device in $(lvdisplay -c $vgname 2>/dev/null | cut -f1 -d:); do
 		fs_type[$device]=$(file -Ls $device)
 		[[ $Debug -gt 0 ]] && echo +++++ fs_type\[$device\] set to \"${fs_type[$device]}\"
 
@@ -249,7 +274,8 @@ if [[ "$curr_data" =~ DOS/MBR ]]; then
 	    continue
 	fi
 
-	# If we get here then we're dealing with some sort of basic file system. Record the "file" output.
+	# If we get here then we're dealing with some sort of basic
+	# file system. Record the "file" output.
 	fs_type[$part]="$ptype"
 	[[ $Debug -gt 0 ]] && echo +++++ fs_type\[$part\] set to \"${fs_type[$part]}\"
     done
@@ -271,28 +297,30 @@ if [[ "$curr_data" =~ DOS/MBR ]]; then
 		    [[ $Debug -gt 0 ]] && echo +++++ $device is root device
 		    break
 		fi
-		umount "$TargetDir/files"
+		umount "$TargetDir/files" 2>/dev/null
 	    done
 	    tail -1 "$CmdFile" >> "$CmdFile.sav"
 	    mv "$CmdFile.sav" "$CmdFile"
 	fi
     fi
 
-    # By the end of the "if" statement above, the root file system should be mounted
-    # No fstab file means we can't proceeed
+    # By the end of the "if" statement above, the root file system should
+    # be mounted. No fstab file means we can't proceeed.
     if [[ ! -f "$TargetDir/files/etc/fstab" ]]; then
 	echo Unable to locate fstab file. Giving up.
 	exit 255
     fi
 
-    # Mount all of the other partitions based on the fstab file in the root file system
+    # Mount all of the other partitions based on the fstab file in the
+    # root file system
     awk '!/^ *#/ && $3 ~ /^(vfat|ext|xfs|btrfs)/' "$TargetDir/files/etc/fstab" |
 	while read device mountpt fstype options; do
 	    [[ $mountpt == '/' ]] && continue             # root was already mounted above
 	    mount_device $device "$TargetDir/files$mountpt" $fstype $options
 	done
 
-    # Now that everything is active and mounted, make E01s of each partition if -E was specified
+    # Now that everything is active and mounted, make E01s of each partition
+    # if -E was specified
     if [[ $MakeExports -eq 1 ]]; then
 	mkdir -p "$TargetDir/exported"
 
@@ -300,21 +328,22 @@ if [[ "$curr_data" =~ DOS/MBR ]]; then
 	df --output=source,target | grep -F "$TargetDir" | sort -b -k2,2 |
 	    while read expdev expdir; do
 
-		# Be careful not to repeat exports when dealing with BTRFS subvols
+		# Careful not to repeat exports when dealing with BTRFS subvols
 		[[ ${exported[$expdev]} -eq 1 ]] && continue
 
 		# Get directory name without the mount point
 		dir_orig=$(echo $expdir | sed "s,$TargetDir/files/*,,")
 		[[ -z "$dir_orig" ]] && dir_orig="root"
 
-		# Convert slashes to underscores to be used in the export file name
+		# Convert slashes to underscores for the export file name
 		dir_noslash=$(echo $dir_orig | sed 's,/,_,g');
 		base_file=$(basename "$Image")
 
 		[[ $Debug -gt 0 ]] && echo +++++ $expdev , $expdir , $dir_orig , $dir_noslash
 
 		# Use ewfacquire to make compressed image of this partition
-		# Capture the output in <file>.txt as well as sending it to the terminal
+		# Capture the output in <file>.txt as well as sending it to
+		# the terminal
 		echo Exporting /$dir_orig file system \($expdev\)
 		[[ $Debug -gt 0 ]] && echo +++++ ewfacquire -u -c fast -S $ChunkSize -t \"$TargetDir/exported/$base_file-$dir_noslash\" $expdev
 		ewfacquire -u -c fast -S $ChunkSize -t "$TargetDir/exported/$base_file-$dir_noslash" $expdev |
