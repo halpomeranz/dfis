@@ -5,5 +5,5 @@ while read line; do
 	echo -ne $(date -d @$(echo $line | sed 's/#//') '+%F %T')\\t
 	continue
     fi
-    echo $line
+    echo "$line"
 done
