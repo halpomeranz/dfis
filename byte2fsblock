@@ -1,0 +1,22 @@
+#!/bin/bash
+
+DEVICE=$1
+
+XFS_DB=/usr/local/sbin/xfs_db
+
+while read byte string; do
+    sector=$(($byte / 512))
+    fsblock=$($XFS_DB -r $DEVICE -c "convert daddr $sector fsblock" | cut -f1 -d' ')
+
+    if [[ "$fsblock" == "$old_fsblock" ]]; then
+	filename=$old_filename
+    else
+	filename=$($XFS_DB -r $DEVICE -c 'blockget -n -s -L' -c "fsblock $fsblock" -c 'blockuse -n' 2>/dev/null | tail -1 | awk '{print $NF}')
+    fi
+
+    echo -e $sector:$fsblock:$filename\\t$string
+
+    old_sector=$sector
+    old_fsblock=$fsblock
+    old_filename=$filename
+done
