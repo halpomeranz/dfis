@@ -1,4 +1,6 @@
 #!/usr/bin/python3
+# Hal Pomeranz (hrpomeranz@gmail.com) - 2025-09-05
+#
 # Adapted from https://github.com/Hi-Angel/scripts/blob/master/btrfs-physical-to-logical-mapping.py
 # and examples from https://github.com/knorrie/python-btrfs as noted below
 

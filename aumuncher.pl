@@ -1,4 +1,7 @@
 #!/usr/bin/perl
+# Hal Pomeranz (hrpomeranz@gmail.com) - 2025-09-05
+#
+# Extracts login/logout information from Linux audit logs
 
 use POSIX;
 

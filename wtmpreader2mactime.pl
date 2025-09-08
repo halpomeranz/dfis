@@ -1,4 +1,5 @@
 #!/usr/bin/perl
+# Hal Pomeranz (hrpomeranz@gmail.com) - 2025-09-05
 
 while (<>) {
     chomp;

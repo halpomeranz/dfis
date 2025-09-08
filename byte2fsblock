@@ -1,4 +1,8 @@
 #!/bin/bash
+# Hal Pomeranz (hrpomeranz@gmail.com) - 2025-09-05
+#
+# strings -a -t d /some/image/file >strings.txt
+# cat strings.txt | byte2fsblock /some/image/file >strings-with-filenames.txt
 
 DEVICE=$1
 

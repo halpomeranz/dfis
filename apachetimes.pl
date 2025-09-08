@@ -1,4 +1,7 @@
 #!/usr/bin/perl
+# Hal Pomeranz (hrpomeranz@gmail.com) - 2025-09-05
+#
+# Prepend sortable human readable dates to Apache audit logs lines
 
 %Months = ('Jan' => '01', 'Feb' => '02', 'Mar' => '03', 'Apr' => '04',
 	   'May' => '05', 'Jun' => '06', 'Jul' => '07', 'Aug' => '08',

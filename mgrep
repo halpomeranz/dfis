@@ -1,4 +1,6 @@
 #!/usr/bin/perl
+# Hal Pomeranz (hrpomeranz@gmail.com) - 2025-09-05
+#
 # mgrep -- match patterns and output messages from Unix mailbox files
 # Usage: mgrep [-i] [-f file] [pattern] file1 ...
 
