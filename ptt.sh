@@ -85,10 +85,12 @@ check_dependencies() {
 	status_output WARNING "$prog program not found"
     done
 
-    docker_out=$(docker manifest inspect log2timeline/plaso 2>/dev/null)
-    if [[ -z "$docker_out" ]]; then
-	dep_missing=1
-	status_output WARNING "Cannot find \"log2timeline/plaso\" docker container"
+    if [[ $NoL2tRun -eq 0 ]]; then
+	docker_out=$(docker manifest inspect log2timeline/plaso 2>/dev/null)
+	if [[ -z "$docker_out" ]]; then
+	    dep_missing=1
+	    status_output WARNING "Cannot find \"log2timeline/plaso\" docker container"
+	fi
     fi
 
     [[ $dep_missing -gt 0 ]] && exit 1
