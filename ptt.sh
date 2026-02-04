@@ -1,6 +1,6 @@
 #!/bin/bash
 # ptt.sh ("Process That Thing!") -- Hal Pomeranz (hrpomeranz@gmail.com)
-# Version: 4.0.0 - 2026-02-03
+# Version: 4.1.0 - 2026-02-04
 #
 # Usage: ptt.sh [options] mountpoint outputdir
 #
@@ -219,8 +219,9 @@ EOF
     status_output lg2time "Finished log2timeline initial processing"
 }
 
-# Link all generated bodyfiles into "$OutputDir/bodyfiles". This is
-# used by do_l2t_merge(), but also may be of use to analysts.
+# Link all generated bodyfiles into "$OutputDir/bodyfiles" for
+# use by analysts (do_l2t_merge() only uses a subset of these
+# because the first l2t pass pulled in logfile data already).
 #
 # Produce a merged CSV timeline with "mactime" and drop it into
 # "$OutputDir/timeline-mactime". Also extract a text file with just
@@ -232,14 +233,14 @@ collect_bodyfiles() {
 	ln "$OutputDir"/timeline-mactime/bodyfile* "$OutputDir/bodyfiles"
     [[ -r "$LogExtraDir/wtmp/bodyfile-wtmp" ]] &&
 	ln "$LogExtraDir/wtmp/bodyfile-wtmp" "$OutputDir/bodyfiles"
-    [[ -r "$LogExtraDir/journal/bodyfile-sshlogins-journal" ]] &&
-	ln "$LogExtraDir/journal/bodyfile-sshlogins-journal" "$OutputDir/bodyfiles"
+    [[ -r "$LogExtraDir/journal/bodyfile-securelogs-journal" ]] &&
+	ln "$LogExtraDir/journal/bodyfile-securelogs-journal" "$OutputDir/bodyfiles"
     [[ -n $(ls "$OutputDir"/strings/audit.log-*-bodyfile 2>/dev/null) ]] &&
 	ln "$OutputDir"/strings/audit.log-*-bodyfile "$OutputDir/bodyfiles"
     [[ -n $(ls "$OutputDir"/strings/syslogs-newstyle-*-bodyfile 2>/dev/null) ]] &&
 	ln "$OutputDir"/strings/syslogs-newstyle-*-bodyfile "$OutputDir/bodyfiles"
-    [[ -r "$LogExtraDir/compressed/bodyfile-compressed-sshlogs" ]] &&
-	ln "$LogExtraDir/compressed/bodyfile-compressed-sshlogs" "$OutputDir/bodyfiles"
+    [[ -r "$LogExtraDir/compressed/bodyfile-compressed-securelogs" ]] &&
+	ln "$LogExtraDir/compressed/bodyfile-compressed-securelogs" "$OutputDir/bodyfiles"
 
     hostext=
     [[ -n "$HostName" ]] && hostext="-$HostName"
@@ -247,20 +248,28 @@ collect_bodyfiles() {
     cat "$OutputDir/bodyfiles"/* | 
         mactime -d -y 2001-01-01 2>/dev/null |
 	tee "$OutputDir/timeline-mactime/timeline-withlogins$hostext.csv" |
-	awk -F, '/,0,macb,----------,0,0,0,/ { print $1"\t"$NF }' |
-	sed 's/"//g; s/T/ /; s/Z//' >"$LogExtraDir/logins/merged-login-data.txt"
+	grep -F ',0,macb,----------,0,0,0,' |
+	sed 's/,0,macb,----------,0,0,0,/\t/; s/"//g; s/T/ /; s/Z//' >"$LogExtraDir/logins/merged-securelog-data.txt"
 }
 
 do_l2t_merge() {
     mydir="$OutputDir/timeline-l2t"
     status_output lg2time "Starting second phase of log2timeline processing..."
 
+    # We need to merge in the filesystem timeline and wtmp info
+    # (the first l2t pass pulled in the systemd journal and other log files).
+    mkdir -p "$mydir/bodyfiles"
+    [[ -n $(ls "$OutputDir"/timeline-mactime/bodyfile* 2>/dev/null) ]] &&
+	ln "$OutputDir"/timeline-mactime/bodyfile* "$mydir/bodyfiles"
+    [[ -r "$LogExtraDir/wtmp/bodyfile-wtmp" ]] &&
+	ln "$LogExtraDir/wtmp/bodyfile-wtmp" "$mydir/bodyfiles"
+
     # Merge the collected body files into the log2timeline data
     status_output lg2time "Merge file system and wtmp data"
     cp /dev/null "$mydir/l2t.log.2"
-    docker run -v "$OutputDir:$OutputDir" log2timeline/plaso log2timeline.py \
+    docker run -v "$mydir:$mydir" log2timeline/plaso log2timeline.py \
 	   --parsers bodyfile --hashers none -z UTC --storage_file "$mydir/image.plaso" \
-	   --status_view linear --status_view_interval 60 "$OutputDir/bodyfiles" >"$mydir/l2t.log.2" 2>&1
+	   --status_view linear --status_view_interval 60 "$mydir/bodyfiles" >"$mydir/l2t.log.2" 2>&1
 
     # Output json_line
     status_output lg2time "Output JSON"
@@ -274,6 +283,8 @@ do_l2t_merge() {
     status_output lg2time "Compress JSON"
     cat "$mydir/$bfname-l2t.jsonl" | sed "s,$MountedDir/*,/,g" | gzip >"$mydir/$bfname-l2t.jsonl.gz"
     rm -f "$mydir/$bfname-l2t.jsonl"
+    cd "$mydir/bodyfiles" && rm -f ./*
+    rmdir "$mydir/bodyfiles"
 
     status_output lg2time "Finished log2timeline processing"
 }
@@ -513,27 +524,33 @@ make_bodyfiles() {
 	while read -r file; do
 	    targfile=${file%%-raw}     # want to operate on de-duped file
 
-	    grep -aE 'sshd[^:]*: (Accepted|Failed) .* for ' "$targfile" |
-		sed 's/^\([^[:space:]]*\).* sshd[^:]*: \(.*\)/\1 \2/' |
+	    grep -aE ' (sshd[^:]*: ((Accepted|Failed) .* for|Invalid user) |sudo[^:]*: .* COMMAND=|(useradd|usermod|groupadd|groupmod|passwd|chsh|chfn)[^:]*: )' "$targfile" |
+		sed 's/^\([^[:space:]]*\) [^:]* \([^:]*: .*\)/\1 \2/' |
 		while read -r timestamp message; do
 		    epoch=$(date -d "$timestamp" '+%s')
+		    message=${message//|/(pipe)}
 		    echo "0|$message|0|----------|0|0|0|$epoch|$epoch|$epoch|$epoch"
 		done >"$targfile-bodyfile"
 	done
 
-    find "$LogExtraDir/compressed" -name \*-newstyle-sshlogs \! -empty |
+    find "$LogExtraDir/compressed" -name \*-newstyle-securelogs \! -empty |
 	while read -r file; do
-	    sed 's/^\([^[:space:]]*\).* sshd[^:]*: \(.*\)/\1 \2/' "$file" |
+	    sed 's/^\([^[:space:]]*\) [^:]* \([^:]*: .*\)/\1 \2/' "$file" |
 		while read -r timestamp message; do
 		    epoch=$(date -d "$timestamp" '+%s')
+		    message=${message//|/(pipe)}
 		    echo "0|$message|0|----------|0|0|0|$epoch|$epoch|$epoch|$epoch"
-		done >>"$LogExtraDir/compressed/bodyfile-compressed-sshlogs"
+		done >>"$LogExtraDir/compressed/bodyfile-compressed-securelogs"
 	done
 
-    # Use jq to make mactime output from SSH login messages
+    # Use jq to make mactime output from interesting security messages
     [[ -r "$LogExtraDir/journal/journal.json" ]] &&
 	cat "$LogExtraDir/journal/journal.json" |
-	jq -r 'select(.MESSAGE | test("^(Accepted|Failed) .* for ")) | "0|\(.MESSAGE)|0|----------|0|0|0|\(._SOURCE_REALTIME_TIMESTAMP | .[:-6])|\(._SOURCE_REALTIME_TIMESTAMP | .[:-6])|\(._SOURCE_REALTIME_TIMESTAMP | .[:-6])|\(._SOURCE_REALTIME_TIMESTAMP | .[:-6])"' >"$LogExtraDir/journal/bodyfile-sshlogins-journal" 2>"$LogExtraDir/journal/bodyfile-sshlogins-journal-errors"
+	    jq -r 'select(._COMM != null and
+                            ((._COMM == "sshd" and (.MESSAGE | test("^((Accepted|Failed) .* for|Invalid user) "))) or
+                             (._COMM == "sudo" and (.MESSAGE | test("COMMAND="))) or
+			     (._COMM | test("useradd|usermod|groupadd|groupmod|passwd|chsh|chfn")))) |
+"0|\(._COMM)[\(._PID)]: \(.MESSAGE | sub("\\|";"(pipe)";"g"))|0|----------|0|0|0|\(._SOURCE_REALTIME_TIMESTAMP | .[:-6])|\(._SOURCE_REALTIME_TIMESTAMP | .[:-6])|\(._SOURCE_REALTIME_TIMESTAMP | .[:-6])|\(._SOURCE_REALTIME_TIMESTAMP | .[:-6])"' >"$LogExtraDir/journal/bodyfile-securelogs-journal" 2>"$LogExtraDir/journal/bodyfile-securelogs-journal-errors"
 }
 
 # Look for *.xz, *.bz2? logs because bulk_extractor doesn't uncompress them.
@@ -559,10 +576,10 @@ do_compressed_logs() {
 	thisext=${file##*.}                # only final extension
 	thisext=${thisext%2}               # "bz2" becomes "bz"
 
-	${thisext}cat "$file" | grep -aE '^[0-9]*-[0-9]*-[0-9]*T[0-9]*:[0-9]*:[0-9]*\.[0-9]*.* sshd[^:]*: (Accepted|Failed) .* for ' >"$file-newstyle-sshlogs"
+	${thisext}cat "$file" | grep -aE '^[0-9]*-[0-9]*-[0-9]*T[0-9]*:[0-9]*:[0-9]*\.[0-9]*.* (sshd[^:]*: ((Accepted|Failed) .* for|Invalid user) |sudo[^:]*: .* COMMAND=|(useradd|usermod|groupadd|groupmod|passwd|chsh|chfn)[^:]*: )' >"$file-newstyle-securelogs"
 	[[ -n "$IocsFile" ]] && ${thisext}cat "$file" | grep -aFf "$IocsFile" >"$LogExtraDir/iocs/$basefile-iochits"
     done
-    find "$complogdir" -name \*-sshlogs -empty -delete
+    find "$complogdir" -name \*-securelogs -empty -delete
     status_output ziplogs "Finished compressed log file processing"
 }
 
@@ -922,7 +939,7 @@ done
 rm -f "$PIDFile"
 
 # Clean up any FIFOs
-(cd "$FIFODir"; rm -f ./*fifo*)
+(cd "$FIFODir" && rm -f ./*fifo*)
 rmdir "$FIFODir" 2>/dev/null
 
 status_output primary "All processing finished!"
