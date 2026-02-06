@@ -1,6 +1,6 @@
 #!/bin/bash
 # ptt.sh ("Process That Thing!") -- Hal Pomeranz (hrpomeranz@gmail.com)
-# Version: 4.1.0 - 2026-02-04
+# Version: 4.2.0 - 2026-02-05
 #
 # Usage: ptt.sh [options] mountpoint outputdir
 #
@@ -49,6 +49,7 @@ TextColor=('WARNING' '\e[0;41m\e[1;37m'      # White text on RED background
 	   'bulk_ex' '\e[0;44m\e[1;37m'      # White text on BLUE background
 	   'miscjob' '\e[1;43m\e[1;37m'      # White text on YELLOW background
 	   'logxtra' '\e[1;43m\e[1;37m'      # White text on YELLOW background
+	   'tradlog' '\e[1;43m\e[1;37m'      # White text on YELLOW background
 	   'ziplogs' '\e[1;43m\e[1;37m'      # White text on YELLOW background
 )
 DefaultColor='\e[0;46m\e[1;37m'              # White text on CYAN background
@@ -104,6 +105,7 @@ ProgSugg=(
     'xzcat'            'try "apt install xz-utils"'
     'statx'            'install from https://github.com/tclahr/statx/'
     'ausorter.pl'      'install from https://github.com/halpomeranz/dfis'
+    'syslog2mactime'   'install from https://github.com/halpomeranz/dfis'
     'wtmpreader.pl'    'install from https://github.com/halpomeranz/dfis'
     'wtmpreader2mactime.pl' 'install from https://github.com/halpomeranz/dfis'
 )
@@ -211,12 +213,49 @@ paths:
   - /root/..*history
   - /home/[^/]*/..*history 
 EOF
-    docker run -v "$MountedDir:$MountedDir" -v "$mydir:$mydir" log2timeline/plaso \
-           log2timeline.py --parsers systemd_journal,text -f "$mydir/l2t-filter.yaml" \
+    docker run -v "$MountedDir:$MountedDir" -v "$mydir:$mydir" --user root log2timeline/plaso \
+           log2timeline.py --parsers linux,!filestat,!utmp -f "$mydir/l2t-filter.yaml" \
 	   --hashers none -z UTC --storage_file "$mydir/image.plaso" \
 	   --status_view linear --status_view_interval 60 "$MountedDir" >"$mydir/l2t.log.1" 2>&1
 
     status_output lg2time "Finished log2timeline initial processing"
+}
+
+do_l2t_merge() {
+    mydir="$OutputDir/timeline-l2t"
+    status_output lg2time "Starting second phase of log2timeline processing..."
+
+    # We need to merge in the filesystem timeline and wtmp info
+    # (the first l2t pass pulled in the systemd journal and other log files).
+    mkdir -p "$mydir/bodyfiles"
+    [[ -n $(ls "$OutputDir"/timeline-mactime/bodyfile* 2>/dev/null) ]] &&
+	ln "$OutputDir"/timeline-mactime/bodyfile* "$mydir/bodyfiles"
+    [[ -r "$LogExtraDir/wtmp/bodyfile-wtmp" ]] &&
+	ln "$LogExtraDir/wtmp/bodyfile-wtmp" "$mydir/bodyfiles"
+
+    # Merge the collected body files into the log2timeline data
+    status_output lg2time "Merge file system and wtmp data"
+    cp /dev/null "$mydir/l2t.log.2"
+    docker run -v "$mydir:$mydir" --user root log2timeline/plaso log2timeline.py \
+	   --parsers bodyfile --hashers none -z UTC --storage_file "$mydir/image.plaso" \
+	   --status_view linear --status_view_interval 60 "$mydir/bodyfiles" >"$mydir/l2t.log.2" 2>&1
+
+    # Output json_line
+    status_output lg2time "Output JSON"
+    [[ -n "$HostName" ]] && bfname=$HostName || bfname='timeline'
+    cp /dev/null "$mydir/l2t.log.3"
+    docker run -v "$mydir:$mydir" --user root log2timeline/plaso \
+	   psort.py -q --status-view none -o json_line \
+	   -w "$mydir/$bfname-l2t.jsonl" "$mydir/image.plaso" >>"$mydir/l2t.log.3" 2>&1
+
+    # Remove mountpoint from file paths and gzip
+    status_output lg2time "Compress JSON"
+    cat "$mydir/$bfname-l2t.jsonl" | sed "s,$MountedDir/*,/,g" | gzip >"$mydir/$bfname-l2t.jsonl.gz"
+    rm -f "$mydir/$bfname-l2t.jsonl"
+    cd "$mydir/bodyfiles" && rm -f ./*
+    rmdir "$mydir/bodyfiles"
+
+    status_output lg2time "Finished log2timeline processing"
 }
 
 # Link all generated bodyfiles into "$OutputDir/bodyfiles" for
@@ -241,52 +280,19 @@ collect_bodyfiles() {
 	ln "$OutputDir"/strings/syslogs-newstyle-*-bodyfile "$OutputDir/bodyfiles"
     [[ -r "$LogExtraDir/compressed/bodyfile-compressed-securelogs" ]] &&
 	ln "$LogExtraDir/compressed/bodyfile-compressed-securelogs" "$OutputDir/bodyfiles"
+    [[ -n $(ls "$LogExtraDir/traditional-syslog/"bodyfile-* 2>/dev/null) ]] &&
+	cat "$LogExtraDir/traditional-syslog/"bodyfile-* >"$OutputDir/bodyfiles/bodyfile-traditional-syslog"
 
     hostext=
     [[ -n "$HostName" ]] && hostext="-$HostName"
     mkdir -p "$LogExtraDir/logins"
     cat "$OutputDir/bodyfiles"/* | 
-        mactime -d -y 2001-01-01 2>/dev/null |
+        mactime -d -y 2>/dev/null |
 	tee "$OutputDir/timeline-mactime/timeline-withlogins$hostext.csv" |
-	grep -F ',0,macb,----------,0,0,0,' |
-	sed 's/,0,macb,----------,0,0,0,/\t/; s/"//g; s/T/ /; s/Z//' >"$LogExtraDir/logins/merged-securelog-data.txt"
-}
-
-do_l2t_merge() {
-    mydir="$OutputDir/timeline-l2t"
-    status_output lg2time "Starting second phase of log2timeline processing..."
-
-    # We need to merge in the filesystem timeline and wtmp info
-    # (the first l2t pass pulled in the systemd journal and other log files).
-    mkdir -p "$mydir/bodyfiles"
-    [[ -n $(ls "$OutputDir"/timeline-mactime/bodyfile* 2>/dev/null) ]] &&
-	ln "$OutputDir"/timeline-mactime/bodyfile* "$mydir/bodyfiles"
-    [[ -r "$LogExtraDir/wtmp/bodyfile-wtmp" ]] &&
-	ln "$LogExtraDir/wtmp/bodyfile-wtmp" "$mydir/bodyfiles"
-
-    # Merge the collected body files into the log2timeline data
-    status_output lg2time "Merge file system and wtmp data"
-    cp /dev/null "$mydir/l2t.log.2"
-    docker run -v "$mydir:$mydir" log2timeline/plaso log2timeline.py \
-	   --parsers bodyfile --hashers none -z UTC --storage_file "$mydir/image.plaso" \
-	   --status_view linear --status_view_interval 60 "$mydir/bodyfiles" >"$mydir/l2t.log.2" 2>&1
-
-    # Output json_line
-    status_output lg2time "Output JSON"
-    [[ -n "$HostName" ]] && bfname=$HostName || bfname='timeline'
-    cp /dev/null "$mydir/l2t.log.3"
-    docker run -v "$mydir:$mydir" log2timeline/plaso \
-	   psort.py -q --status-view none -o json_line \
-	   -w "$mydir/$bfname-l2t.jsonl" "$mydir/image.plaso" >>"$mydir/l2t.log.3" 2>&1
-
-    # Remove mountpoint from file paths and gzip
-    status_output lg2time "Compress JSON"
-    cat "$mydir/$bfname-l2t.jsonl" | sed "s,$MountedDir/*,/,g" | gzip >"$mydir/$bfname-l2t.jsonl.gz"
-    rm -f "$mydir/$bfname-l2t.jsonl"
-    cd "$mydir/bodyfiles" && rm -f ./*
-    rmdir "$mydir/bodyfiles"
-
-    status_output lg2time "Finished log2timeline processing"
+	grep -E ',0,macb,(----------|N/A[[:space:]]*),0,0,0,' |
+	sed 's/,0,macb,[^,]*,0,0,0,/\t/; s/"//g; s/T/ /; s/Z//' >"$LogExtraDir/logins/merged-securelog-data.txt"
+    [[ -n "$IocsFile" ]] &&
+	grep -aFf "$IocsFile" "$LogExtraDir/logins/merged-securelog-data.txt" >"$LogExtraDir/logins/merged-securelog-data-iochits.txt"
 }
 
 # Pulling extra de-duplication processing into this routine so that it
@@ -396,11 +402,11 @@ do_strings() {
     # If UAC dir, we're going to run BE on the "[root]" directory
     # If mounted directory, we're running BE on the underlying device files
     sources=(); paths=()
-    uac_extra=
+    becmd='bulk_extractor'
     if [[ -n "$UACDir" ]]; then
 	sources+=("$MountedDir")
 	paths+=("uacroot")
-	uac_extra='-R'
+	becmd='bulk_extractor -R'
     else
         # Be careful here because BTRFS subvols can appear as the same device
 	declare -A seen_device
@@ -465,7 +471,7 @@ do_strings() {
 	gzpid=$!
 
 	# Here goes bulk_extractor!
-	bulk_extractor -o "$bedir" $uac_extra -e wordlist -S strings=1 -S word_max=4096 -S notify_rate=60 "$thissource" >>"$bedir/be.log" 2>&1
+	$becmd -o "$bedir" -e wordlist -S strings=1 -S word_max=4096 -S notify_rate=60 "$thissource" >>"$bedir/be.log" 2>&1
 
 	# Process any carved wtmp data
 	wtmpdir="$LogExtraDir/wtmp"
@@ -525,20 +531,18 @@ make_bodyfiles() {
 	    targfile=${file%%-raw}     # want to operate on de-duped file
 
 	    grep -aE ' (sshd[^:]*: ((Accepted|Failed) .* for|Invalid user) |sudo[^:]*: .* COMMAND=|(useradd|usermod|groupadd|groupmod|passwd|chsh|chfn)[^:]*: )' "$targfile" |
-		sed 's/^\([^[:space:]]*\) [^:]* \([^:]*: .*\)/\1 \2/' |
+		sed 's/^\([^[:space:]]*\) [^:]* \([^:]*: .*\)/\1 \2/; s,|,(pipe),g' |
 		while read -r timestamp message; do
 		    epoch=$(date -d "$timestamp" '+%s')
-		    message=${message//|/(pipe)}
 		    echo "0|$message|0|----------|0|0|0|$epoch|$epoch|$epoch|$epoch"
 		done >"$targfile-bodyfile"
 	done
 
-    find "$LogExtraDir/compressed" -name \*-newstyle-securelogs \! -empty |
+    find "$LogExtraDir/compressed" -name \*-newstyle-securelogs \! -empty 2>/dev/null |
 	while read -r file; do
-	    sed 's/^\([^[:space:]]*\) [^:]* \([^:]*: .*\)/\1 \2/' "$file" |
+	    sed 's/^\([^[:space:]]*\) [^:]* \([^:]*: .*\)/\1 \2/; s,|,(pipe),g' "$file" |
 		while read -r timestamp message; do
 		    epoch=$(date -d "$timestamp" '+%s')
-		    message=${message//|/(pipe)}
 		    echo "0|$message|0|----------|0|0|0|$epoch|$epoch|$epoch|$epoch"
 		done >>"$LogExtraDir/compressed/bodyfile-compressed-securelogs"
 	done
@@ -576,19 +580,114 @@ do_compressed_logs() {
 	thisext=${file##*.}                # only final extension
 	thisext=${thisext%2}               # "bz2" becomes "bz"
 
-	${thisext}cat "$file" | grep -aE '^[0-9]*-[0-9]*-[0-9]*T[0-9]*:[0-9]*:[0-9]*\.[0-9]*.* (sshd[^:]*: ((Accepted|Failed) .* for|Invalid user) |sudo[^:]*: .* COMMAND=|(useradd|usermod|groupadd|groupmod|passwd|chsh|chfn)[^:]*: )' >"$file-newstyle-securelogs"
+	${thisext}cat "$file" |
+	    grep -aE '^[0-9]*-[0-9]*-[0-9]*T[0-9]*:[0-9]*:[0-9]*\.[0-9]*.* (sshd[^:]*: ((Accepted|Failed) .* for|Invalid user) |sudo[^:]*: .* COMMAND=|(useradd|usermod|groupadd|groupmod|passwd|chsh|chfn)[^:]*: )' >"$file-newstyle-securelogs"
 	[[ -n "$IocsFile" ]] && ${thisext}cat "$file" | grep -aFf "$IocsFile" >"$LogExtraDir/iocs/$basefile-iochits"
     done
     find "$complogdir" -name \*-securelogs -empty -delete
     status_output ziplogs "Finished compressed log file processing"
 }
 
+# Traditional Syslog format is a PITA because: (1) there is no year
+# information in the timestamps, and (2) the timestamps are written
+# in the local time zone for the system. We try to derive the year
+# from the log file's mtime and looking at the log contents to see
+# if the log appears to span multiple years. We work some time zone
+# magic to convert the times to UTC via syslog2mactime. The result
+# is a bodyfile with selected security-related log messages.
+
+declare -A MonNum=(['Jan']=1 ['Feb']=2 ['Mar']=3 ['Apr']=4
+		   ['May']=5 ['Jun']=6 ['Jul']=7 ['Aug']=8
+		   ['Sep']=9 ['Oct']=10 ['Nov']=11 ['Dec']=12)
+
+do_traditional_syslogs() {
+    cd "$MountedDir/var/log" 2>/dev/null || return
+    found_logs=$(grep -arlP '[A-Z][a-z]{2} ( |\d)\d \d{2}:\d{2}:\d{2} [-.\w]+ (sshd|sudo|useradd|usermod|groupadd|groupmod|passwd|chsh|chfn)[^:]*:\s+' -- * 2>/dev/null)
+    [[ -n "$found_logs" ]] || return
+
+    status_output "tradlog" "Starting traditional Syslog files processing"
+    mydir="$LogExtraDir/traditional-syslog"
+    mkdir -p "$mydir"
+    
+    # Traditional Syslogs are written in the local time zone of the machine.
+    # So we need to figure out what that is. Best effort here-- there are
+    # weird cases where the code below can fail.
+    #
+    # We set our time zone to the time zone from the image. syslog2mactime
+    # will then shift everything back to epoch time in UTC.
+    image_tz=
+    if [[ -f "$MountedDir/etc/timezone" ]]; then
+	image_tz=$(cat "$MountedDir/etc/timezone")
+    elif [[ -h "$MountedDir/etc/localtime" ]]; then
+	image_tz=$(readlink "$MountedDir/etc/localtime")
+    elif [[ -r "$MountedDir/etc/localtime" ]]; then
+	thissum=$(md5sum "$MountedDir/etc/localtime" | cut -d' ' -f1)
+	image_tz=$(find "$MountedDir/usr/share/zoneinfo" -type f -print0 |
+		       xargs -0 md5sum | grep "^$thissum" | head -1)
+    fi
+    image_tz=${image_tz##*zoneinfo/}
+    export TZ="$image_tz"
+
+    # $found_logs will have the names of uncompressed log files that match.
+    # Want to make sure we also look in any compressed logs that may exist.
+    #
+    for i in $found_logs; do echo "${i%%.*}"; done | sort -u |
+	while read -r basefile; do
+	    for file in "$basefile"*; do
+		# Figure out the file extension and see if it matches a
+		# known compression type (z, gz, bz, bz2, xz).
+		# gz/z -> z (as in zcat), bz2 -> bz.
+		fext=$(echo "$file" | tr '[:upper:]' '[:lower:]' |
+			   sed -E 's/.*\.([bgx]?z)2?$/\1/; s/^g//')
+		[[ "$fext" == "$file" ]] && fext=
+
+		# In UAC collections, btime is the time the archive
+		# was unpacked while mtime comes from date in archive.
+		# So we have to work from the mtime.
+		mtime_year=$(stat -c '%y' "$file" | cut -f1 -d-)
+
+		# There is no year information in the traditional Syslog.
+		# So we're going to make a good faith effort to figure out
+		# which year the log starts in. We look at the rolling months
+		# in the log file to try and determine if the year wraps.
+		# This approach fails if the log messages are sparse,
+		# but the latest log messages should have the correct years
+		# based on the last modified time of the file.
+		year_changes=0
+		prev_mnum=0
+		while read -r month; do
+		    this_mnum=${MonNum[$month]}
+		    [[ $this_mnum -lt $prev_mnum ]] && ((year_changes++))
+		    prev_mnum=$this_mnum
+		done < <(awk '{print $1}' "$file" | uniq)
+		start_year=$(( $mtime_year - $year_changes ))
+
+		# Optionally uncompress the file, then grep for the log
+		# messages we're interested in. The matching lines go into
+		# syslog2mactime to be converted into bodyfile format
+		name_noslash=${file//\//_}
+		${fext}cat "$file" |
+		    grep -aE ' (sshd[^:]*: ((Accepted|Failed) .* for|Invalid user) |sudo[^:]*: .* COMMAND=|(useradd|usermod|groupadd|groupmod|passwd|chsh|chfn)[^:]*: )' |
+		    sed 's,|,(pipe),g' |
+		    syslog2mactime -y "$start_year" >"$mydir/bodyfile-$name_noslash.mactime"
+	    done
+	done
+
+    find "$mydir" -name bodyfile-\* -empty -delete
+    unset TZ
+    status_output "tradlog" "Finished traditional Syslog files processing"
+}
+
 do_logs_extra() {
     status_output "logxtra" "Starting extra log processing"
+
     # Look for BZ/XZ compressed logs since bulk_extractor doesn't get them
     do_compressed_logs &
-    thispid=$!
-    echo $thispid >>"$PIDFile"
+    le_cl_pid=$!
+
+    # Look for security-related messages in old-style Syslog logs
+    do_traditional_syslogs &
+    le_ts_pid=$!
 
     # Pull data from existing wtmp files
     wtmpdir="$LogExtraDir/wtmp"
@@ -625,7 +724,10 @@ do_logs_extra() {
 	# Also make JSON output from systemd journal, used in make_bodyfiles()
 	journalctl -D "$MountedDir/var/log/journal" -q -o json --utc >"$LogExtraDir/journal/journal.json"
     fi
-    
+
+    # Wait for do_compressed_logs() and do_traditional_syslogs()
+    wait -f $le_cl_pid $le_ts_pid
+
     status_output "logxtra" "Finished extra log processing"
 }
 
@@ -680,6 +782,7 @@ do_misc_tasks() {
     status_output miscjob "Finished miscellaneous tasks"
 }
 
+# These modules run without issues
 VolSafeModules=(
 bash.Bash
 boottime.Boottime
@@ -722,6 +825,9 @@ tracing.tracepoints.CheckTracepoints
 vmcoreinfo.VMCoreInfo
 )
 
+# These modules have been known to either run indefinitely or
+# consume enough RAM to be killed by the kernel. We are going to
+# run them separately so we can time them out if necessary.
 VolBewareModules=(
 pagecache.Files
 pagecache.RecoverFs
@@ -738,6 +844,11 @@ do_volatility_plugins() {
     dvp_counter=0
     dvp_output='/dev/null'
 
+    # Most plugins are going to run in a single volshell session
+    # to avoid the overhead of having to re-read the memory image
+    # for each plugin. Some tricky shenanigans in the first loop
+    # to output JSON, and to split output into separate files by
+    # module name in the second loop.
     for module in "${VolSafeModules[@]}"; do
 	mod_class=${module%%.*}
 
@@ -760,6 +871,9 @@ do_volatility_plugins() {
 	echo "$line" >>"$dvp_output"
     done
 
+    # Now run the Volatility modules that have been known to hang.
+    # Each one runs in a separate vol.py command line, wrapped by
+    # "timeout" so they get shut down if they appear to be taking too long.
     status_output "memory " "Running potentially slow volatility modules"
     for module in "${VolBewareModules[@]}"; do
 	timeout 20m vol -q -r jsonl -f "$MemoryDumpFile" -o "$voloutputdir" "linux.$module" >"$voloutputdir/$module.json" 2>"$voloutputdir/$module.json-errors"
@@ -768,7 +882,7 @@ do_volatility_plugins() {
     if [[ -r "$IocsFile" ]]; then
 	status_output "memory " "Checking IOCs against volatility output"
 	cd "$voloutputdir"
-	grep -raFf "$IocsFile" * >.grep$$ 2>.grep$$-errs
+	grep -raFf "$IocsFile" -- * >.grep$$ 2>.grep$$-errs
 	mv .grep$$ IOC-output.txt
 	mv .grep$$-errs IOC-errors.txt
     fi
@@ -776,6 +890,8 @@ do_volatility_plugins() {
     status_output "memory " "Finished volatility on memory image"
 }
 
+# Runs bulk_extractor on the memory image, including extracting strings.
+# If a list of IOCs is provided, grep for them against the BE output.
 do_be_on_memory() {
     status_output "memory " "Running bulk_extractor on memory image"
     mem_bedir="$OutputDir/memory/bulk_extractor"
@@ -787,7 +903,7 @@ do_be_on_memory() {
     if [[ -r "$IocsFile" ]]; then
 	status_output "memory " "Checking IOCs against bulk_extractor memory data"
 	cd "$mem_bedir"
-	grep -raFf "$IocsFile" * >.grep$$ 2>.grep$$-errs
+	grep -raFf "$IocsFile" -- * >.grep$$ 2>.grep$$-errs
 	mv .grep$$ IOC-output.txt
 	mv .grep$$-errs IOC-errors.txt
     fi
@@ -795,6 +911,8 @@ do_be_on_memory() {
     status_output "memory " "Finished bulk_extractor on memory image"
 }
 
+# Triggers do_volatility_plugins() and do_be_on_memory() in parallel
+# and waits for them both to finish.
 do_memory() {
     status_output "memory " "Starting memory analysis jobs on $MemoryDumpFile"
 
@@ -873,7 +991,6 @@ fi
 # Collecting log information here
 LogExtraDir="$OutputDir/logs-extra"
 
-
 # If $OutputDir is not a Linux file system, we need to put FIFOs
 # in some other location
 [[ -n "$WorkingDir" ]] && FIFODir="$WorkingDir/fifos" || FIFODir="$OutputDir/fifos"
@@ -887,25 +1004,38 @@ PIDFile="$OutputDir/.pids"
 
 status_output primary "Starting processing-- go relax with a beverage..."
 
+# Generate a mactime bodyfile with statx
 do_fs_timeline &
 FSTimePID=$!
 
+# Run log2timeline to parse log files in /var/log and user history files
 if [[ $NoL2tRun -eq 0 ]]; then
     do_l2t_firstpass &
     L2TTimePID=$!
 fi
 
+# Run Volatility and bulk_extractor against memory image
 if [[ -n "$MemoryDumpFile" ]]; then
     do_memory &
     MemoryPID=$!
 fi
 
+# Run bulk_extractor against mounted devices or UAC "[root]" directory.
+# Will carve strings if run against devices. Extracts different log formats
+# (audit logs, Syslogs, web logs) into separate files for later processing.
+# Runs IOC searches if appropriate.
 do_strings &
 StringsPID=$!
 
+# Special processing for BZ/XZ compressed logs (not handled by bulk_extractor),
+# traditional Syslogs (no years, also translate from system local time zone),
+# wtmp files (runs wtmpreader.pl and wtmpreader2mactime), and sytemd journal
+# (dumps as text and JSON for later processing).
 do_logs_extra &
 LogsPID=$!
 
+# Makes lists of archive files and hidden directories. Collects scheduled
+# task config files.
 do_misc_tasks &
 MiscPID=$!
 
@@ -930,13 +1060,15 @@ wait -f $MemoryPID $MiscPID
 
 # Can't use "wait" because these processes were subprocesses of
 # backgrounded tasks
-pidmatch=$(cat "$PIDFile" | tr \\n \| | sed 's,|$,,')
-while true; do
-    foundpid=$(ps -ef | awk "\$2 ~ /^$pidmatch\$/ {print \$2}")
-    [[ -z "$foundpid" ]] && break
-    sleep 30
-done
-rm -f "$PIDFile"
+if [[ -r "$PIDFile" ]]; then
+    pidmatch=$(cat "$PIDFile" | tr \\n \| | sed 's,|$,,')
+    while true; do
+	foundpid=$(ps -ef | awk "\$2 ~ /^$pidmatch\$/ {print \$2}")
+	[[ -z "$foundpid" ]] && break
+	sleep 30
+    done
+    rm -f "$PIDFile"
+fi
 
 # Clean up any FIFOs
 (cd "$FIFODir" && rm -f ./*fifo*)
