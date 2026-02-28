@@ -1,6 +1,6 @@
 #!/bin/bash
 # ptt.sh ("Process That Thing!") -- Hal Pomeranz (hrpomeranz@gmail.com)
-# Version: 4.2.0 - 2026-02-05
+# Version: 4.2.1 - 2026-02-28
 #
 # Usage: ptt.sh [options] mountpoint outputdir
 #
@@ -599,6 +599,7 @@ do_compressed_logs() {
 declare -A MonNum=(['Jan']=1 ['Feb']=2 ['Mar']=3 ['Apr']=4
 		   ['May']=5 ['Jun']=6 ['Jul']=7 ['Aug']=8
 		   ['Sep']=9 ['Oct']=10 ['Nov']=11 ['Dec']=12)
+MonthList="${!MonNum[*]}"
 
 do_traditional_syslogs() {
     cd "$MountedDir/var/log" 2>/dev/null || return
@@ -656,10 +657,11 @@ do_traditional_syslogs() {
 		year_changes=0
 		prev_mnum=0
 		while read -r month; do
+		    [[ -n "$month" && "$MonthList" =~ "$month" ]] || continue
 		    this_mnum=${MonNum[$month]}
 		    [[ $this_mnum -lt $prev_mnum ]] && ((year_changes++))
 		    prev_mnum=$this_mnum
-		done < <(awk '{print $1}' "$file" | uniq)
+		done < <(${fext}cat "$file" | awk '{print $1}' | uniq)
 		start_year=$(( $mtime_year - $year_changes ))
 
 		# Optionally uncompress the file, then grep for the log
