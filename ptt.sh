@@ -1,6 +1,6 @@
 #!/bin/bash
 # ptt.sh ("Process That Thing!") -- Hal Pomeranz (hrpomeranz@gmail.com)
-# Version: 4.2.1 - 2026-02-28
+# Version: 4.2.2 - 2026-03-11
 #
 # Usage: ptt.sh [options] mountpoint outputdir
 #
@@ -82,7 +82,7 @@ check_directories() {
 	elif [[ -f "$MountedDir/uac.log" ]]; then
 	    status_output "INFO:::" "Looks like a UAC collection"
 	    UACDir="$MountedDir"
-	    MountedDir="$UACDir/[root]"
+	    MountedDir=$(echo "$UACDir"/*/etc | sed 's,/etc$,,')
 	else
 	    # TODO: we should distinguish between a mountpoint vs. random
 	    # directory in the filesystem. Random directory should do
