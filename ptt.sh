@@ -695,6 +695,7 @@ do_logs_extra() {
     wtmpdir="$LogExtraDir/wtmp"
     mkdir -p "$wtmpdir"
     if [[ -d "$MountedDir/var/log" ]]; then
+	status_output "logxtra" "Processing wtmp data in $MountedDir/var/log"
 	cd "$MountedDir/var/log"
 	for file in wtmp*; do
 	    if [[ "$file" =~ \.([bgx]z|bz2)$ ]]; then
@@ -717,6 +718,7 @@ do_logs_extra() {
 
     # Dump systemd journal to text file and do IoC search if applicable
     if [[ -d "$MountedDir/var/log/journal" ]]; then
+	status_output "logxtra" "Processing Systemd journal"
 	mkdir -p "$LogExtraDir/journal"
 	journalctl -D "$MountedDir/var/log/journal" -q -o short-iso --utc >"$LogExtraDir/journal/journal.txt"
 	if [[ -r "$IocsFile" ]]; then
