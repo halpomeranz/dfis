@@ -84,7 +84,7 @@ jq -r \
     "User: \(.user), Token ID: \(.token_id)"
  elif ((.action == "org.invite_member") and (.user != null)) then
     "User: \(.user)"
- elif ((.action == "org.invite_member") and (.invitee_email = null)) then
+ elif ((.action == "org.invite_member") and (.invitee_email != null)) then
     "Invite Email: \(.invitee_email)"
  elif (.action | test("^(org|repo).add_member$")) then
     "User: \(.user), Perms: \(.permission)"
