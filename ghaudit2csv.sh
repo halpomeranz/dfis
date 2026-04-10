@@ -1,7 +1,7 @@
 #!/usr/bin/sh
 # ghaudit2csv.sh -- Hal Pomeranz (hrpomeranz@gmail.com)
 #    Convert GitHub audit logs exported in JSON format to CSV file
-# Version: 1.0.0 - 2026-04-02
+# Version: 1.0.1 - 2026-04-10
 #
 # Usage: cat audit_log.json | ghaudit2csv.sh >audit_log.csv
 #
@@ -70,6 +70,8 @@ jq -r \
     "Token ID: \(.token_id)"
  elif .action == "org_credential_authorization.revoke" then
     "Owner: \(.owner), Token ID: \(.token_id), Scopes: \(.token_scopes)"
+ elif .action == "organization_role.revoke" then
+    "User: \(.user), Role: \(.organization_role_name)"
  elif .action == "personal_access_token.access_granted" then
     "User: \(.user), Token ID: \(.token_id), Repos: \(.repositories), Perms: \(.permissions)"
  elif .action == "personal_access_token.access_revoked" then
@@ -94,6 +96,8 @@ jq -r \
     "User: \(.user), Old Perms: \(.old_repo_permission), New Perms: \(.new_repo_permission)"
  elif (.action | test("^(org|repo).remove_member$")) then
     "User: \(.user)"
+ elif .action == "repository_invitation.create" then
+    "Invitee: \(.invitee)"
  elif .action == "org.audit_log_export" then
     "Query: \(.query_phrase)"
  elif .action == "repo.rename" then
@@ -104,6 +108,8 @@ jq -r \
     "Old Default: \(.changes.old_default_branch), New Default: \(.changes.default_branch)"
  elif (.action | test("^repository_security_configuration\\.")) then
     "Config Name: \(.security_configuration_name)"
+ elif (.action | test("^repository_vulnerability_alert\\.")) then
+    "Alert ID: \(.alert_id), Alert Num: \(.alert_number)"
  elif (.action | test("^org\\.oauth_app_access_")) then
     "OAuth App: \(.oauth_application_name), URL: \(.url)"
  elif (.action | test("^(org|repo)\\.(create|update|remove)_actions_secret")) then
@@ -112,7 +118,7 @@ jq -r \
     "Integration: \(.integration), Key: \(.key)"
  elif (.action | test("^team.(add_member|remove_member|promote_maintainer)$")) then
     "User: \(.user), Team: \(.team), Team Type: \(.team_type)"
- elif (.action | test("^team.(create|add_to_organization|add_repository)$")) then
+ elif (.action | test("^team.(create|add_to_organization|(add|remove)_repository)$")) then
     "Team: \(.team), Team Type: \(.team_type)"
  elif .action == "team.update_repository_permission" then
     "Team: \(.team), Old Perms: \(.old_repo_permission), New Perms: \(.new_repo_permission)"
@@ -124,8 +130,18 @@ jq -r \
     "Alert ID: \(.alert_id), Alert Num: \(.alert_number)"
  elif (.action | test("^repository_vulnerability_alert\\.auto_(dismiss|reopen)$")) then
     "Alert ID: \(.alert_id), Alert Num: \(.alert_number), Rule Name: \(.vulnerability_alert_rule_name)"
- elif .action == "secret_scanning_alert.validate" then
+ elif (.action | test("^secret_scanning_alert\\.")) then
     "Secret Type: \(.secret_type), Display Name: \(.secret_type_display_name)"
+ elif (.action | test("^required_status_check\\.")) then
+    "Context: \(.context)"
  elif (.action | test("^packages\\.package_version_")) then
     "Package: \(.package)"
+ elif (.action | test("^environment\\.")) then
+    "Environment: \(.environment_name)"
+ elif (.action | test("^public_key\\.")) then
+    "Title: \(.title), Fingerprint: \(.fingerprint)"
+ elif .actor != .user and .user != null then
+    "User: \(.user)"
+ elif .repo == null and .org != null then
+    "Organization: \(.org)"
  else null end] | @csv'
