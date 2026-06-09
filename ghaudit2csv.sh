@@ -1,7 +1,7 @@
 #!/usr/bin/sh
 # ghaudit2csv.sh -- Hal Pomeranz (hrpomeranz@gmail.com)
 #    Convert GitHub audit logs exported in JSON format to CSV file
-# Version: 1.0.1 - 2026-04-10
+# Version: 1.0.2 - 2026-06-09
 #
 # Usage: cat audit_log.json | ghaudit2csv.sh >audit_log.csv
 #
@@ -13,6 +13,7 @@
 #  Actor: GitHub username of person making request, e.g. "halpomeranz"
 #  Ext Actor Name: Usually an email address like "hrpomeranz@gmail.com"
 #  Actor IP: source IP of request, not present on all audit records
+#  Hashed Token: Useful for correlating suspicious activities
 #  User Agent: Reported user agent on request (can be spoofed)
 #  Additional Info: Other useful info, determined by record type
 #
@@ -20,7 +21,7 @@
 # See https://docs.github.com/en/organizations/keeping-your-organization-secure/managing-security-settings-for-your-organization/displaying-ip-addresses-in-the-audit-log-for-your-organization
 
 # Output header for CSV file
-echo '"Date/Time","Action","Operation","Repo","Actor","Ext Actor Name","Actor IP","User Agent","Additional Info"'
+echo '"Date/Time","Action","Operation","Repo","Actor","Ext Actor Name","Actor IP","Hashed Token","User Agent","Additional Info"'
 
 # The jq script below looks worse than it actually is. We convert each
 # line of JSON into an array which gets sent to jq's CSV output routine
@@ -39,7 +40,7 @@ jq -r \
  '[(."@timestamp" / 1000 | strftime("%F %T.")) +
                                    (."@timestamp" | tostring | .[-3:]),
  .action, .operation_type, .repo, .actor,
- .external_identity_nameid, .actor_ip, .user_agent,
+ .external_identity_nameid, .actor_ip, .hashed_token, .user_agent,
  if (.action | test("^workflows.(created|cancel|delete)_workflow_run$")) then
     "Run ID: \(.workflow_run_id), Name: \(.name), Head SHA: \(.head_sha), Head Branch: \(.head_branch)"
  elif .action == "workflows.rerun_workflow_run" then
