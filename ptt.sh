@@ -1,6 +1,6 @@
 #!/bin/bash
 # ptt.sh ("Process That Thing!") -- Hal Pomeranz (hrpomeranz@gmail.com)
-# Version: 4.2.2 - 2026-03-11
+# Version: 4.2.3 - 2026-06-19
 #
 # Usage: ptt.sh [options] mountpoint outputdir
 #
@@ -35,6 +35,7 @@ Usage: $0 [options] sourcedir outputdir
     -L           Do not run log2timline
     -M memdump   Location of memory dump file to process
     -W workdir   Local dir in case output dir is non-Linux file system
+    -B 'args'    Extra command line args to pass to bulk_extractor
     -C           Just check that dependencies are met and then exit
 EOM
     exit 1;
@@ -471,7 +472,7 @@ do_strings() {
 	gzpid=$!
 
 	# Here goes bulk_extractor!
-	$becmd -o "$bedir" -e wordlist -S strings=1 -S word_max=4096 -S notify_rate=60 "$thissource" >>"$bedir/be.log" 2>&1
+	$becmd -o "$bedir" -e wordlist -S strings=1 -S word_max=4096 -S notify_rate=60 $ExtraBEArgs "$thissource" >>"$bedir/be.log" 2>&1
 
 	# Process any carved wtmp data
 	wtmpdir="$LogExtraDir/wtmp"
@@ -682,6 +683,7 @@ do_traditional_syslogs() {
 
 do_logs_extra() {
     status_output "logxtra" "Starting extra log processing"
+    mkdir -p "$LogExtraDir/iocs"
 
     # Look for BZ/XZ compressed logs since bulk_extractor doesn't get them
     do_compressed_logs &
@@ -941,8 +943,11 @@ NoL2tRun=0
 MemoryDumpFile=
 WorkingDir=
 CheckDepsOnly=0
-while getopts "CH:i:LM:W:" opts; do
+ExtraBEArgs=
+while getopts "B:CH:i:LM:W:" opts; do
     case $opts in
+	B) ExtraBEArgs="$OPTARG"
+           ;;
 	C) CheckDepsOnly=1
 	   ;;
 	H) HostName=$OPTARG
