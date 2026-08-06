@@ -1,23 +1,32 @@
 #!/bin/bash
-# Hal Pomeranz (hrpomeranz@gmail.com) -- 2025-04-27
+# Hal Pomeranz (hrpomeranz@gmail.com) -- 2026-08-05
 # Distributed under the Creative Commons Attribution-ShareAlike 4.0 license (CC BY-SA 4.0)
-# Version: 1.2.0
+# Version: 2.0.0
+#
+# TODO clean this up
+#shellcheck disable=SC2086
 
 usage() {
     cat <<EOM
-Automatically mount image files (libewf-tools is required for E01s). 
+Automatically mount image files (libewf-tools is required for E01s,
+xmount required for the -W/-V/-A options).
+
 Use -U option to unmount what was previously mounted.
 
-Usage: $0 [-D] [-E -S chunksize] [-d mountpoint] image
+Usage: $0 [-D] [-W | -V/A newname ] [-E [-S chunksize]] [-d mountpoint] image
        $0 [-D] -U mountpoint
 
-    -D       Output debugging details
+    -D          Output debugging details
 
-    -d dir    Specify mounting point (default is "mount")
-    -E	      Export E01s of partitions from image
-    -S size   Specify the max segment size for EO1 exports (in bytes)
+    -d dir      Specify mounting point (default is "mount")
+    -E	        Export E01s of partitions from image
+    -S size     Specify the max segment size for E01 exports (in bytes)
 
-    -U dir    Unmount everything on dir
+    -W          Mount image with writable cache file
+    -V newname  Change volume group name before mounting (implies -W)
+    -A newname  Change VG name and all UUIDs before mounting (implies -W)
+
+    -U dir      Unmount everything on dir
 EOM
     exit 1;
 }
@@ -30,7 +39,7 @@ do_unmount() {
     declare -A loop_devs
 
     # See bottom of loop for inputs
-    while read dev dir; do
+    while read -r dev dir; do
 	umount "$dir"
 	[[ $Debug -gt 0 ]] && echo +++++ unmounted \"$dir\" \(device is \"$dev\"\)
 
@@ -69,13 +78,51 @@ do_unmount() {
 	[[ $Debug -gt 0 ]] && echo +++++ losetup -d $dev
     done
 
-    # unmount to stop any ewfmount processes that are running
+    # Stop xmount and ewfmount process(es), if any
+    xmount_img=$(ls "$UnmountDir"/xmount/img/*.dd 2>/dev/null)
+    if [[ -n "$xmount_img" ]]; then
+	umount "$UnmountDir/xmount/img" 2>/dev/null
+	[[ $Debug -gt 0 ]] &&
+	    echo +++++ xmount: unmounting \"$UnmountDir/xmount/img\"
+
+	oldcache="$UnmountDir/xmount/cachefile"
+	newcache="$oldcache"_$(date '+%s')
+	mv "$oldcache" "$newcache" 2>/dev/null
+	[[ $Debug -gt 0 ]] &&
+	    echo ++++++ moving old xmount cache to "$newcache"
+    fi
     if [[ -f "$UnmountDir/img/ewf1" ]]; then
 	umount "$UnmountDir/img"
-	[[ $Debug -gt 0 ]] && echo +++++ unmounting \"$UnmountDir/img\"
+	[[ $Debug -gt 0 ]] &&
+	    echo +++++ ewfmount: unmounting \"$UnmountDir/img\"
     fi
 
     exit 0
+}
+
+# Convert "file" output to fstab equivalent file system type.
+# Using echo here because bash "return" can't return strings.
+#
+get_fs_type() {
+    file_string=$1
+
+    [[ "$file_string" == 'xfs' || "$file_string" =~ XFS ]] &&
+	echo 'xfs' && return 0
+
+    [[ "$file_string" =~ ext4 ]] && echo 'ext4' && return 0
+    [[ "$file_string" =~ ext3 ]] && echo 'ext3' && return 0
+    [[ "$file_string" =~ ext2 ]] && echo 'ext2' && return 0
+
+    [[ "$file_string" == 'btrfs' || "$file_string" =~ BTRFS ]] &&
+	echo 'btrfs' && return 0
+
+    [[ "$file_string" == 'vfat' || "$file_string" =~ FAT ]] &&
+	echo 'vfat' && return 0
+
+    [[ "$file_string" =~ swap ]] && echo 'swap' && return 0
+    [[ "$file_string" =~ DOS/MBR ]] && echo 'fulldisk' && return 0
+
+    echo 'unknown' && return 1
 }
 
 # Mount device with appropriate options for various file systems.
@@ -89,25 +136,40 @@ mount_device() {
 
     [[ $Debug -gt 0 ]] && echo +++++ mount_device\($device, $targdir, $fstype\)
 
-    if [[ "$fstype" == 'btrfs' || "$fstype" =~ BTRFS ]]; then
+    orig_device="$device"
+    if [[ -n "$NewVGName" ]]; then
+	device=${device/$OldVGName/$NewVGName}
+    fi
+    if [[ $ChangeUUIDs -gt 0 && $device =~ ^UUID= ]]; then
+	ouuid=${device#UUID=}
+	[[ -n "${new_uuid[$ouuid]}" ]] &&
+	    device=${device/$ouuid/${new_uuid[$ouuid]}}
+    fi
+    [[ $Debug -gt 0 ]] && [[ "$orig_device" != "$device" ]] &&
+	echo +++++ Device \"$orig_device\" changed to \"$device\"
+	    
+    if [[ "$fstype" == 'btrfs' ]]; then
 	extra=',noexec,norecovery'
 	[[ $options =~ subvol= ]] && extra="$extra,$options"
     elif [[ "$fstype" =~ ext[34] ]]; then
 	extra=',noexec,noload -t ext4'
-    elif [[ "$fstype" =~ ext2 ]]; then
+	fstype=ext
+    elif [[ "$fstype" == 'ext2' ]]; then
 	extra=',noexec'
-    elif [[ "$fstype" == 'xfs' || "$fstype" =~ XFS ]]; then
+	fstype=ext
+    elif [[ "$fstype" == 'xfs' ]]; then
 	extra=',noexec,norecovery'
-    elif [[ "$fstype" == 'vfat' || "$fstype" =~ FAT ]]; then
+	fstype=xfs
+    elif [[ "$fstype" == 'vfat' ]]; then
 	extra=
-    elif [[ "$fstype" =~ (swap|DOS/MBR) ]]; then
+    elif [[ "$fstype" == 'swap' ]]; then
 	return
     else
-	echo $device: $fstype
-	echo I do not know what this is. Skipping.
+	echo $device: skipping unexpected type \"$fstype\"
 	return
     fi
-	    
+
+    # Mount that file system!
     mount -o ro$extra $device "$targdir"
     echo mount -o ro$extra $device \"$targdir\" >>"$CmdFile"
     [[ $Debug -gt 0 ]] && echo +++++ mount -o ro$extra $device \"$targdir\"
@@ -118,11 +180,19 @@ mount_device() {
 
 TargetDir='mount'
 Debug=0
+DoXmount=0
+ChangeUUIDs=0
+NewVGName=
+OldVGName=
 MakeExports=0
 ChunkSize=4294967296                 # 4GB
 UnmountDir=
-while getopts "d:DES:U:" opts; do
+while getopts "A:d:DES:U:V:W" opts; do
     case $opts in
+	A) NewVGName=$OPTARG
+	   ChangeUUIDs=1
+	   DoXmount=1
+	   ;;
 	d) TargetDir=$OPTARG
 	   ;;
         D) Debug=1
@@ -133,13 +203,20 @@ while getopts "d:DES:U:" opts; do
 	   ;;
 	U) UnmountDir=$OPTARG
 	   ;;
+	V) NewVGName=$OPTARG
+	   DoXmount=1
+	   ;;
+	W) DoXmount=1
+	   ;;
         *) usage
            ;;
     esac
 done
 
 # do_unmount exits program once unmounting is finished
-[[ -n "$UnmountDir" ]] && do_unmount
+# Do a fixup here in case user specified "-U .../files/" rather than
+#    just the toplevel directory
+[[ -n "$UnmountDir" ]] && UnmountDir=${UnmountDir%%/files*} && do_unmount
 
 shift $(($OPTIND-1))
 Image=$1
@@ -148,10 +225,13 @@ if [[ $Debug -gt 0 ]]; then
     cat <<EOM
 +++++ Image: $Image
 +++++ Dir: $TargetDir
++++++ Xmount=$DoXmount / ChangeUUIDs=$ChangeUUIDs / NewVGname=$NewVGName
 +++++ Exports: $MakeExports
 +++++ Debug: $Debug
 EOM
 fi
+
+
 
 # Make absolute paths so that commands in MOUNTING file will work anywhere
 # Supplied image file must be readable
@@ -196,7 +276,7 @@ if [[ "$curr_data" =~ EWF ]]; then
     mkdir -p "$TargetDir/img"
     im_dir=$(dirname "$curr_image")
     im_name=$(basename "$curr_image")
-    (cd "$im_dir"; ewfmount "$im_name" "$TargetDir/img") >/dev/null 2>&1
+    (cd "$im_dir" && ewfmount "$im_name" "$TargetDir/img") >/dev/null 2>&1
     [[ $Debug -gt 0 ]] && echo +++++ \(cd \"$im_dir\"\; ewfmount \"$im_name\" \"$TargetDir/img\"\)
 
     # No ewf1 file? Can't proceed
@@ -215,23 +295,51 @@ EOM
     curr_data=$(file -Ls "$curr_image")
 fi
 
+# Set up xmount cache if requested
+if [[ $DoXmount -gt 0 ]]; then
+    mkdir -p "$TargetDir/xmount/img" &&
+	echo mkdir -p \"$TargetDir/xmount/img\" >>$CmdFile
+    [[ $Debug -gt 0 ]] && echo +++++ xmount --cache "$TargetDir/xmount/cachefile" --in raw "$curr_image" "$TargetDir/xmount/img"
+    xmount --cache "$TargetDir/xmount/cachefile" --in raw "$curr_image" "$TargetDir/xmount/img"
+
+    # image file should now be xmount virtual disk
+    curr_image=$(ls "$TargetDir/xmount/img/"*.dd 2>/dev/null)
+
+    if [[ ! -r "$curr_image" ]]; then
+	echo xmount failed!
+	exit 255
+    fi
+
+    cat <<EOM >>"$CmdFile"
+mkdir -p "$TargetDir/xmount/img"
+xmount --cache "$TargetDir/xmount/cachefile" --in raw "$curr_image" "$TargetDir/xmount/img"
+
+EOM
+fi
 
 # Step 2 -- Is this a full disk image?
 if [[ "$curr_data" =~ DOS/MBR ]]; then
     declare -A fs_type
+    declare -A new_uuid
 
     # "losetup -P" is magical:
     #   -- sets up loop devices to all partitions (e.g. /dev/loop0p1)
     #   -- runs vgscan to find LVM groups (but does not activate them)
-    #
-    loop_device=$(losetup --show -rfP "$curr_image")
-    echo -e losetup -rfP \"$curr_image\"\\n >>"$CmdFile"
+    # losetup "-r" option depends on xmount choice
+    if [[ $DoXmount -gt 0 ]]; then
+	loop_opts='-fP'
+    else
+	loop_opts='-rfP'
+    fi
+    
+    loop_device=$(losetup --show $loop_opts "$curr_image")
+    echo -e losetup $loop_opts \"$curr_image\"\\n >>"$CmdFile"
     [[ $Debug -gt 0 ]] && echo +++++ Loopback device is $loop_device
 
     # Now iterate over each partition
     root_dev=
     root_type=
-    for part in ${loop_device}p*; do
+    for part in "$loop_device"p*; do
 	ptype=$(file -Ls $part)
 
 	# Skip if partition table or swap
@@ -243,6 +351,7 @@ if [[ "$curr_data" =~ DOS/MBR ]]; then
 	    vgname=$(pvdisplay -c $part 2>/dev/null | cut -f2 -d:)
 
 	    # Are we dealing with a duplicate volume name? Bail!
+	    # -V/-A can't work if duplicate name already present
 	    if [[ $(vgdisplay -c 2>/dev/null | cut -f1 -d: | grep -F "$vgname" | wc -l) -gt 1 ]]; then
 		echo \*\*\* MAJOR ISSUE\!
 		echo \*\*\* Looks like there is already a volume group with the name \"$vgname\" mounted here.
@@ -252,6 +361,22 @@ if [[ "$curr_data" =~ DOS/MBR ]]; then
 		do_unmount                # do_unmount() exits the program
 	    fi
 
+	    # Were -V/-A options given?
+	    if [[ -n "$NewVGName" ]]; then
+		[[ $Debug -gt 0 ]] && echo +++++ vgrename "$vgname" "$NewVGName"
+		vgrename "$vgname" "$NewVGName" >/dev/null 2>&1
+		OldVGName="$vgname"
+		vgname="$NewVGName"
+		echo vgrename "$OldVGName" "$NewVGName" >>"$CmdFile"
+	    fi
+	    if [[ $ChangeUUIDs -gt 0 ]]; then
+		[[ $Debug -gt 0 ]] && echo +++++ Changing LVM UUIDs
+		pvchange -u "$part" >/dev/null 2>&1 &&
+		    echo pvchange -u "$part" >>$CmdFile
+		vgchange -u "$vgname" >/dev/null 2>&1 &&
+		    echo vgchange -u "$vgname" >> $CmdFile
+	    fi
+	    
 	    # Need to activate the volume group ("vgchange -a y")
 	    vgchange -a y $vgname >/dev/null 2>&1
 	    echo -e vgchange -a y $vgname\\n >>"$CmdFile"
@@ -259,7 +384,8 @@ if [[ "$curr_data" =~ DOS/MBR ]]; then
 	    # Now look at each device in the volume group and save the
 	    # "file" output into an associative array
 	    for device in $(lvdisplay -c $vgname 2>/dev/null | cut -f1 -d:); do
-		fs_type[$device]=$(file -Ls $device)
+		filestr=$(file -Ls $device)
+		fs_type[$device]=$(get_fs_type "$filestr")
 		[[ $Debug -gt 0 ]] && echo +++++ fs_type\[$device\] set to \"${fs_type[$device]}\"
 
 		# Could this be the root device? If so, note it.
@@ -267,6 +393,30 @@ if [[ "$curr_data" =~ DOS/MBR ]]; then
 		    root_dev=$device
 		    root_type="${fs_type[$device]}"
 		    [[ $Debug -gt 0 ]] && echo +++++ $device is root device
+		fi
+
+		# Do we need to change UUIDs (-A option selected)?
+		# TODO: deal with btrfs and other file systems
+		if [[ $ChangeUUIDs -gt 0 ]]; then
+		    orig_uuid=$(echo "$filestr" | sed 's/.*UUID=\([^[:space:]]*\) .*/\1/')
+		    if [[ "${fs_type[$device]}" =~ ^ext[234] ]]; then
+			# tune2fs will fail if device is not recently checked
+			e2fsck -y -f $device >/dev/null 2>&1 &&
+			    echo e2fsck -y -f $device >>"$CmdFile"
+			(echo y | tune2fs -U random $device) >/dev/null 2>&1 &&
+			    echo -e tune2fs -U random $device\\n >>"$CmdFile"
+		    elif [[ "${fs_type[$device]}" == "xfs" ]]; then
+			# xfs_admin fails if file system "dirty" (underplayed)
+			mount -o noexec $device "$targdir" &&
+			    echo mount -o noexec $device \"$targdir\" >>"$CmdFile"
+			umount "$targdir" &&
+			    echo umount \"$targdir\" >>"$CmdFile"
+			xfs_admin -U generate $device >/dev/null 2>&1 &&
+			    echo -e xfs_admin -U generate $device\\n >>"$CmdFile"
+		    fi
+
+		    new_uuid[$orig_uuid]=$(file -Ls $device | sed 's/.*UUID=\([^[:space:]]*\) .*/\1/')
+		    [[ $Debug -gt 0 ]] && echo +++++ $device: Changing file system UUID from \"$orig_uuid\" to \"${new_uuid[$orig_uuid]}\"
 		fi
 	    done
 
@@ -276,7 +426,7 @@ if [[ "$curr_data" =~ DOS/MBR ]]; then
 
 	# If we get here then we're dealing with some sort of basic
 	# file system. Record the "file" output.
-	fs_type[$part]="$ptype"
+	fs_type[$part]=$(get_fs_type "$ptype")
 	[[ $Debug -gt 0 ]] && echo +++++ fs_type\[$part\] set to \"${fs_type[$part]}\"
     done
 
@@ -285,7 +435,7 @@ if [[ "$curr_data" =~ DOS/MBR ]]; then
 	mount_device $root_dev "$TargetDir/files" "$root_type"
     else
 	if [[ ${#fs_type[@]} -eq 1 ]]; then     # Only one partition? It's got to be the root file system
-	    root_dev=${!fs_type[@]}
+	    root_dev=${!fs_type[*]}
 	    root_type="${fs_type[$root_dev]}"
 	    mount_device $root_dev "$TargetDir/files" "$root_type"
 	else                                    # We have to mount partitions until we find the fstab file
@@ -299,6 +449,7 @@ if [[ "$curr_data" =~ DOS/MBR ]]; then
 		fi
 		umount "$TargetDir/files" 2>/dev/null
 	    done
+
 	    tail -1 "$CmdFile" >> "$CmdFile.sav"
 	    mv "$CmdFile.sav" "$CmdFile"
 	fi
@@ -314,7 +465,7 @@ if [[ "$curr_data" =~ DOS/MBR ]]; then
     # Mount all of the other partitions based on the fstab file in the
     # root file system
     awk '!/^ *#/ && $3 ~ /^(vfat|ext|xfs|btrfs)/' "$TargetDir/files/etc/fstab" |
-	while read device mountpt fstype options; do
+	while read -r device mountpt fstype options; do
 	    [[ $mountpt == '/' ]] && continue             # root was already mounted above
 	    mount_device $device "$TargetDir/files$mountpt" $fstype $options
 	done
@@ -326,7 +477,7 @@ if [[ "$curr_data" =~ DOS/MBR ]]; then
 
 	declare -A exported
 	df --output=source,target | grep -F "$TargetDir" | sort -b -k2,2 |
-	    while read expdev expdir; do
+	    while read -r expdev expdir; do
 
 		# Careful not to repeat exports when dealing with BTRFS subvols
 		[[ ${exported[$expdev]} -eq 1 ]] && continue
@@ -336,7 +487,7 @@ if [[ "$curr_data" =~ DOS/MBR ]]; then
 		[[ -z "$dir_orig" ]] && dir_orig="root"
 
 		# Convert slashes to underscores for the export file name
-		dir_noslash=$(echo $dir_orig | sed 's,/,_,g');
+		dir_noslash=${dir_orig//\//_}
 		base_file=$(basename "$Image")
 
 		[[ $Debug -gt 0 ]] && echo +++++ $expdev , $expdir , $dir_orig , $dir_noslash
