@@ -1,12 +1,11 @@
 #!/bin/bash
-# Hal Pomeranz (hrpomeranz@gmail.com) -- 2026-10-09
+# Hal Pomeranz (hrpomeranz@gmail.com) -- 2026-10-10
 # Distributed under the Creative Commons Attribution-ShareAlike 4.0 license (CC BY-SA 4.0)
-# Version: 3.0.0
+# Version: 3.1.0
 #
-# TODO deal with Linux software RAID sets
-# TODO add support for renaming images with multiple volume groups
-# TODO clean up these shellcheck warnings
+# TODO clean this up
 #shellcheck disable=SC2086
+# TODO add support for renaming images with multiple volume groups
 
 usage() {
     cat <<EOM
@@ -38,20 +37,12 @@ EOM
 # 
 do_unmount() {
     declare -A found_vgs
-    declare -A loop_devs
+    declare -A raid_devs
 
     # See bottom of loop for inputs
     while read -r dev dir; do
 	umount "$dir"
 	[[ $Debug -gt 0 ]] && echo +++++ unmounted \"$dir\" \(device is \"$dev\"\)
-
-	# Capture unique loopback devices ("/dev/loop0" not "/dev/loop0p1")
-	if [[ $dev =~ ^/dev/loop[0-9] ]]; then
-	    maindev=$(echo $dev | sed 's,\(/dev/loop[0-9]*\)p[0-9]*,\1,')
-	    loop_devs[$maindev]=1
-	    [[ $Debug -gt 0 ]] && echo +++++ loop device $maindev
-	fi
-
 	# Is this device part of a volume group?
 	# Capture all unique volume group names
 	vgname=$(lvdisplay -c $dev 2>/dev/null | cut -f2 -d:)
@@ -59,12 +50,14 @@ do_unmount() {
 	    found_vgs[$vgname]=1
 	    [[ $Debug -gt 0 ]] && echo +++++ volume group name $vgname
 
-	    ldev=$(pvdisplay -c 2>/dev/null | awk -F: "/$vgname/ {print \$1}")
-	    if [[ $ldev =~ /dev/loop ]]; then
-		ldev=$(echo $ldev | sed 's,\(/dev/loop[0-9]*\)p[0-9]*,\1,')
-		loop_devs[$ldev]=1
-		[[ $Debug -gt 0 ]] && echo +++++ loop device $ldev
-	    fi
+	    # Get name of underlying block device
+	    dev=$(pvdisplay -c 2>/dev/null | awk -F: "/$vgname/ {print \$1}" | sed 's/ *//')
+	fi
+
+	# Capture unique RAID devices
+	if [[ $dev =~ ^/dev/md[0-9]* ]]; then
+	    raid_devs[$dev]=1
+	    [[ $Debug -gt 0 ]] && echo +++++ Found RAID device $dev
 	fi
     done< <(df --output=source,target | grep -F "$UnmountDir" | sort -b -k2,2 -r)
 
@@ -74,11 +67,13 @@ do_unmount() {
 	[[ $Debug -gt 0 ]] && echo +++++ vgchange -a n $vgname
     done
 
+    # Stop RAID devices
+    mdadm -S "${!raid_devs[@]}" 2>/dev/null
+    [[ $Debug -gt 0 ]] && echo "+++++ Stopping RAID devices ${!raid_devs[*]}"
+    
     # "losetup -d" on all loopback devices
-    for dev in "${!loop_devs[@]}"; do
-	losetup -d $dev 2>/dev/null 
-	[[ $Debug -gt 0 ]] && echo +++++ losetup -d $dev
-    done
+    losetup -d $(losetup -a | grep -F "$UnmountDir" | cut -d: -f1) 2>/dev/null 
+    [[ $Debug -gt 0 ]] && echo "+++++ Disconnecting loop devices"
 
     # Stop xmount process(es), save cache files, if necessary
     xmount_img=$(ls "$UnmountDir"/xmount/file*/*.dd 2>/dev/null)
@@ -101,7 +96,7 @@ do_unmount() {
     if [[ -n "$ewf_mounts" ]]; then
 	umount "$UnmountDir/"img/file*
 	[[ $Debug -gt 0 ]] &&
-	    echo +++++ ewfmount: unmounting \"$UnmountDir/img\"
+	    echo "+++++ ewfmount: unmounting \"$UnmountDir/img/file*\""
     fi
 
     exit 0
@@ -307,8 +302,9 @@ done
 ##### -- Create raw image files if necessary
 ##### -- Set up loopback mounts to everything
 ##### -- Save "file" output for each loopback device
+##### -- Deal with Linux software RAID sets
 #
-declare -A LoopDevs
+declare -A DevList
 for ((i=0; i < ${#FilePaths[@]}; i++)); do
     curr_image="${FilePaths[$i]}"
     curr_data=$(file -Ls "$curr_image")
@@ -388,12 +384,35 @@ EOM
     loop_targs=$(ls "$loop_device"p* 2>/dev/null)
     [[ -z "$loop_targs" ]] && loop_targs=$loop_device
 
-    # Populate info about each loop device
+    # Populate info about each loop or RAID device
+    # RAID devices are tricky because they don't activate until we've
+    # set up all the loopback devices. So we put a placeholder in for now
+    # and then address them after the outer loop ends (see below).
     for ldev in $loop_targs; do
-	[[ $Debug -gt 0 ]] && echo "+++++ Loopback device: $ldev"
-	LoopDevs[$ldev]=$(file -Ls $ldev)
+	devinfo=$(file -Ls $ldev)
+	if [[ "$devinfo" =~ Linux\ Software\ RAID ]]; then
+	    raiddev="/dev/md/$(echo $devinfo | sed 's/.*name=//; s/ .*//')"
+	    [[ -n "${DevList[$raiddev]}" ]] && continue
+	    DevList[$raiddev]='wait for activation'
+	    [[ $Debug -gt 0 ]] && echo "+++++ RAID device: $raiddev"
+	else
+	    DevList[$ldev]=$devinfo
+	    [[ $Debug -gt 0 ]] && echo "+++++ Loopback device: $ldev"
+	fi
     done
 done
+
+# small pause while RAID devices are auto-assembled
+sleep 1
+# Get info about any (now hopefully active) RAID devices
+# TODO Changing UUIDs is currently not supported
+for thisdev in "${!DevList[@]}"; do
+    [[ "$thisdev" =~ ^/dev/md/ ]] || continue
+    DevList[$thisdev]=$(file -Ls $thisdev)
+
+    [[ $ChangeUUIDs -gt 0 ]] && echo "*** Changing UUIDs for RAID devices is currently not supported"
+done
+
 
 #####
 ##### Step 2:
@@ -409,8 +428,8 @@ root_type=
 # If -A option was given, we need to change any LVM PV UUIDS here before
 # the volumes are activated in the next step
 if [[ $ChangeUUIDs -gt 0 ]]; then
-    for ldev in "${!LoopDevs[@]}"; do
-	if [[ "${LoopDevs[$ldev]}" =~ LVM2 ]]; then
+    for ldev in "${!DevList[@]}"; do
+	if [[ "${DevList[$ldev]}" =~ LVM2 ]]; then
 	    [[ $Debug -gt 0 ]] && olduuid=$(pvdisplay -c $ldev | sed 's/.*://')
 	    
 	    pvchange -u "$ldev" >/dev/null 2>&1 &&
@@ -424,8 +443,9 @@ if [[ $ChangeUUIDs -gt 0 ]]; then
     done
 fi
 
-for ldev in "${!LoopDevs[@]}"; do
-    ptype="${LoopDevs[$ldev]}"
+declare -A SeenVG
+for ldev in "${!DevList[@]}"; do
+    ptype="${DevList[$ldev]}"
     
     # Skip if partition table or swap
     [[ "$ptype" =~ (DOS/MBR|swap) ]] && continue
@@ -434,6 +454,7 @@ for ldev in "${!LoopDevs[@]}"; do
     if [[ "$ptype" =~ LVM2 ]]; then
 	# Get the volume group name
 	vgname=$(pvdisplay -c $ldev 2>/dev/null | cut -f2 -d:)
+	[[ $Debug -gt 0 ]] && echo "+++++ $ldev: volume group \"$vgname\""
 
 	# Are we dealing with a duplicate volume name? Bail!
 	# -V/-A can't work if duplicate name already present
@@ -446,43 +467,47 @@ for ldev in "${!LoopDevs[@]}"; do
 	    do_unmount                # do_unmount() exits the program
 	fi
 
-	# Were -V/-A options given?
 	# Be careful not to trigger this code twice on split volumes
-	if [[ -n "$NewVGName"  && -z "$OldVGName" ]]; then
-	    # rename volume group
+	[[ -n "${SeenVG[$vgname]}" ]] && continue
+	SeenVG[$vgname]='yes'
+
+	# Was -V or -A option given? Rename volume group
+	if [[ -n "$NewVGName" ]]; then
 	    [[ $Debug -gt 0 ]] && echo +++++ vgrename "$vgname" "$NewVGName"
 	    vgrename "$vgname" "$NewVGName" >/dev/null 2>&1
 	    OldVGName="$vgname"
 	    vgname="$NewVGName"
+	    SeenVG[$NewVGName]='yes'
 	    echo vgrename "$OldVGName" "$NewVGName" >>"$CmdFile"
-
-	    # change volume group UUID
-	    vgchange -u "$vgname" >/dev/null 2>&1 &&
-		echo vgchange -u "$vgname" >> $CmdFile
-	    
-	    # Need to activate the volume group ("vgchange -a y")
-	    vgchange -a y $vgname >/dev/null 2>&1 && 
-		echo -e vgchange -a y $vgname\\n >>"$CmdFile"
-
-	    # Now look at each device in the volume group and save the
-	    # "file" output into an associative array
-	    for device in $(lvdisplay -c $vgname 2>/dev/null | cut -f1 -d:); do
-		filestr=$(file -Ls $device)
-		fs_type[$device]=$(get_fs_type "$filestr")
-		[[ $Debug -gt 0 ]] && echo +++++ fs_type\[$device\] set to \"${fs_type[$device]}\"
-
-		# Could this be the root device? If so, note it.
-		if [[ -z $root_dev && $device =~ root$ ]]; then
-		    root_dev=$device
-		    root_type="${fs_type[$device]}"
-		    [[ $Debug -gt 0 ]] && echo +++++ $device is root device
-		fi
-
-		# Do we need to change UUIDs (-A option selected)?
-		[[ $ChangeUUIDs -gt 0 ]] && change_vol_uuid $device
-	    done
 	fi
 
+	# Was -A option given? Change volume group UUID
+	[[ $ChangeUUIDs -gt 0 ]] &&
+	    vgchange -u "$vgname" >/dev/null 2>&1 &&
+	    echo vgchange -u "$vgname" >> $CmdFile
+	
+	# Need to activate the volume group ("vgchange -a y")
+	vgchange -a y $vgname >/dev/null 2>&1 && 
+	    echo -e vgchange -a y $vgname\\n >>"$CmdFile"
+
+	# Now look at each device in the volume group and save the
+	# "file" output into an associative array
+	for device in $(lvdisplay -c $vgname 2>/dev/null | cut -f1 -d:); do
+	    filestr=$(file -Ls $device)
+	    fs_type[$device]=$(get_fs_type "$filestr")
+	    [[ $Debug -gt 0 ]] && echo +++++ fs_type\[$device\] set to \"${fs_type[$device]}\"
+
+	    # Could this be the root device? If so, note it.
+	    if [[ -z $root_dev && $device =~ root$ ]]; then
+		root_dev=$device
+		root_type="${fs_type[$device]}"
+		[[ $Debug -gt 0 ]] && echo +++++ $device is root device
+	    fi
+
+	    # Do we need to change UUIDs (-A option selected)?
+	    [[ $ChangeUUIDs -gt 0 ]] && change_vol_uuid $device
+	done
+    
 	# Done processing the LVM volume. Don't fall through.
 	continue
     fi
