@@ -1,7 +1,7 @@
 #!/bin/bash
-# Hal Pomeranz (hrpomeranz@gmail.com) -- 2026-10-10
+# Hal Pomeranz (hrpomeranz@gmail.com) -- 2026-10-15
 # Distributed under the Creative Commons Attribution-ShareAlike 4.0 license (CC BY-SA 4.0)
-# Version: 3.1.0
+# Version: 3.2.0
 #
 # TODO clean this up
 #shellcheck disable=SC2086
@@ -125,6 +125,129 @@ get_fs_type() {
     [[ "$file_string" =~ DOS/MBR ]] && echo 'fulldisk' && return 0
 
     echo 'unknown' && return 1
+}
+
+
+# Sum up superblock data as unsigned 32-bit values (checksum field is null)
+# Add data from devs[max_dev] array that follows superblock
+# Make a 32 bit value by adding the upper 32 bits to the lower 32 bits
+# Outputs little-endian hex value for new checksum
+#
+# See calc_sb_1_csum() function at
+# https://github.com/md-raid-utilities/mdadm/blob/main/super1.c
+#
+calc_raid_checksum() {
+    loop_device=$1
+    new_supe=$2
+    max_dev=$3
+
+    new_checksum=0
+
+    # Superblock data is in little-endian. Have to convert to big-endian
+    # before adding into checksum
+    for ((i=0; i < 64; i++)); do
+	fourbytes=${new_supe:$((i*8)):8}
+	fourbytes=$(echo $fourbytes | sed -E 's/(..)(..)(..)(..)/0x\4\3\2\1/')
+	new_checksum=$((new_checksum + fourbytes))
+    done
+
+    # max_dev is the number of 16-bit values in the devs[] array
+    # We have to convert it from little-endian first and then figure
+    #    out how many 256 byte chunks we're going to read
+    max_dev=$(echo $max_dev | sed -E 's/(..)(..)(..)(..)/0x\4\3\2\1/')
+    num_chunks=$(( (max_dev * 2) / 256 ))
+
+    # Keep adding to checksum value. Note the pipeline at the end of the
+    # loop is giving us a list of four byte values in big-endian format
+    # with the leading "0x" already added.
+    while read -r fourbytes; do
+	new_checksum=$((new_checksum + fourbytes))
+    done< <(dd if="$loop_device" bs=256 skip=17 count="$num_chunks" 2>/dev/null | xxd -e -c 4 | awk '{print "0x"$2}')
+
+    # Calculate final checksum value
+    # Render as (big-endian) hex
+    # Output as little-endian for calling function (with no leading "0x")
+    new_checksum=$(( (new_checksum & 0x00000000ffffffff) + (new_checksum >> 32) ))
+    printf "%08x" "$new_checksum" | sed -E 's/(..)(..)(..)(..)/\4\3\2\1/'
+}
+
+# Writes new RAID superblock to specified device with new name and UUID.
+# Complications here due to having to calculate a correct checksum for
+# the new superblock. In addition, we have to update the bitmap superblock
+# with the new UUID (thankfully no checksum to compute here).
+#
+replace_raid_superblock() {
+    loop_device=$1
+    new_name=$2
+    new_raid_uuid=$3
+
+    # The RAID superblock (v1) is a 256 byte structure which is 4KiB from
+    # the beginning of the volume. The data is in little-endian format.
+    orig_supe=$(dd if="$loop_device" bs=256 skip=16 count=1 2>/dev/null | xxd -p | tr -d \\n)
+
+    # Check that we have the right magic number
+    if [[ ! "$orig_supe" =~ ^fc4e2ba9 ]]; then
+	echo '*** RAID superblock format not recognized. No changes made!'
+	return
+    fi
+
+    # Carve out bits that don't change
+    orig_preamble=${orig_supe:0:32}
+    orig_data=${orig_supe:128:304}
+
+    # We need these values for later. We actually don't care about the
+    # original checksum, but documenting its position for completeness.
+    bitmap_offset=${orig_supe:192:8}
+    # orig_checksum=${orig_supe:432:8}
+    max_dev=${orig_supe:440:8}
+
+    # Hex encode new name
+    # Pad name field out to 32 bytes by adding nulls
+    encoded_name=$(echo -n $new_name | od -An -w32 -tx1 | tr -d ' ')
+    name_field=$(echo -n "$encoded_name$(printf '0%.s' {1..64})" | cut -c 1-64)
+
+    # Assemble new superblock data with nulls for the checksum field
+    # Calculate new checksum
+    # Assemble final data to write back
+    new_supe="${orig_preamble}${new_raid_uuid}${name_field}${orig_data}00000000${max_dev}$(printf '0%.s' {1..64})"
+    new_checksum=$(calc_raid_checksum "$loop_device" "$new_supe" "$max_dev")
+    new_supe="${orig_preamble}${new_raid_uuid}${name_field}${orig_data}${new_checksum}${max_dev}$(printf '0%.s' {1..64})"
+
+    # Start creating data that will be written back to disk-- first we have
+    # 4KiB of nulls and our new superblock data
+    tmpfile="$TargetDir/.new_super_data"
+    dd if=/dev/zero of="$tmpfile" bs=4096 count=1 2>/dev/null &&
+	echo -n "$new_supe" | xxd -r -p >>"$tmpfile" &&
+	cat <<EOM >>$CmdFile
+dd if=/dev/zero of="$tmpfile" bs=4096 count=1
+echo -n "$new_supe" | xxd -r -p >>"$tmpfile"
+EOM
+
+    # bitmap_offset is the number of 512 byte sectors after the RAID
+    # superblock where the bitmap starts with its own bitmap-specific
+    # superblock. We need to figure out this offset value and copy the
+    # intervening data into our tmpfile (less one 256 byte chunk for
+    # the new superblock we've already written).
+    bitmap_offset=$(echo $bitmap_offset | sed -E 's/(..)(..)(..)(..)/0x\4\3\2\1/')
+    chunk_count=$(( (bitmap_offset*2) - 1))   # in 256 byte chunks
+    dd if="$loop_device" bs=256 skip=17 count=$chunk_count 2>/dev/null >>"$tmpfile" && echo "dd if=\"$loop_device\" bs=256 skip=17 count=$chunk_count >>\"$tmpfile\"" >>$CmdFile
+
+    # Now grab the bitmap superblock and swap in the new UUID (no checksum
+    #    that we need to fiddle with)
+    # Append the new bitmap superblock to our tmpfile
+    orig_bit_supe=$(dd if="$loop_device" bs=256 skip=$((17+chunk_count)) count=1 2>/dev/null | xxd -p | tr -d \\n)
+    echo "${orig_bit_supe:0:16}${new_raid_uuid}${orig_bit_supe:48}" |
+	xxd -r -p >>"$tmpfile" &&
+	echo "echo \"${orig_bit_supe:0:16}${new_raid_uuid}${orig_bit_supe:48}\" | xxd -r -p >>\"$tmpfile\"" >>$CmdFile
+
+    # Overwrite the RAID info on disk with the data in our tmpfile
+    dd if="$tmpfile" of="$loop_device" 2>/dev/null &&
+	rm -f "$tmpfile" &&
+	cat <<EOM >>$CmdFile
+dd if="$tmpfile" of="$loop_device"
+rm -f "$tmpfile"
+EOM
+    [[ $Debug -gt 0 ]] && echo "+++++ Wrote new superblock to $loop_device"
 }
 
 # Changes the UUID for a given volume-- LVM or local.
@@ -305,6 +428,7 @@ done
 ##### -- Deal with Linux software RAID sets
 #
 declare -A DevList
+declare -A RaidLoops
 for ((i=0; i < ${#FilePaths[@]}; i++)); do
     curr_image="${FilePaths[$i]}"
     curr_data=$(file -Ls "$curr_image")
@@ -391,7 +515,9 @@ EOM
     for ldev in $loop_targs; do
 	devinfo=$(file -Ls $ldev)
 	if [[ "$devinfo" =~ Linux\ Software\ RAID ]]; then
-	    raiddev="/dev/md/$(echo $devinfo | sed 's/.*name=//; s/ .*//')"
+	    raidname=$(echo $devinfo | sed 's/.*name=//; s/ .*//')
+	    RaidLoops["$raidname"]="${RaidLoops[$raidname]},$ldev"
+	    raiddev="/dev/md/$raidname"
 	    [[ -n "${DevList[$raiddev]}" ]] && continue
 	    DevList[$raiddev]='wait for activation'
 	    [[ $Debug -gt 0 ]] && echo "+++++ RAID device: $raiddev"
@@ -402,16 +528,49 @@ EOM
     done
 done
 
-# small pause while RAID devices are auto-assembled
-sleep 1
-# Get info about any (now hopefully active) RAID devices
-# TODO Changing UUIDs is currently not supported
-for thisdev in "${!DevList[@]}"; do
-    [[ "$thisdev" =~ ^/dev/md/ ]] || continue
-    DevList[$thisdev]=$(file -Ls $thisdev)
+# Do we have any RAID arrays we need to deal with?
+#
+if [[ ${#RaidLoops[*]} -gt 0 ]]; then
+    # small pause while RAID devices are auto-assembled
+    sleep 1 && echo 'sleep 1' >>$CmdFile
 
-    [[ $ChangeUUIDs -gt 0 ]] && echo "*** Changing UUIDs for RAID devices is currently not supported"
-done
+    if [[ $ChangeUUIDs -gt 0 ]]; then
+	for name in "${!RaidLoops[@]}"; do
+	    # Have to stop RAID devices to replace superblock info.
+	    # We may have to disable an LVM volume before stopping md device.
+	    vgname=$(pvdisplay -c "/dev/md/$name" 2>/dev/null | cut -d: -f2)
+	    [[ -n "$vgname" ]] &&
+		vgchange -a n "$vgname" >/dev/null 2>&1 &&
+		echo "vgchange -a n \"$vgname\"" >>$CmdFile
+	    mdadm -S "/dev/md/$name" 2>/dev/null &&
+		echo mdadm -S "/dev/md/$name" >>$CmdFile
+
+	    # Generate a new RAID device name and UUID
+	    # Overwrite superblocks via loop devices
+	    # Update info tracking arrays with new RAID name
+	    new_name="$name$NewVGName"
+	    new_raid_uuid=$(cat /dev/urandom | tr -dc 0-9a-f | head -c32)
+	    [[ $Debug -gt 0 ]] && echo "+++++ Changing /dev/md/$name to /dev/md/$new_name, UUID $new_raid_uuid"
+	    for ldev in $(echo "${RaidLoops[$name]}" | tr , ' '); do
+		replace_raid_superblock "$ldev" "$new_name" "$new_raid_uuid"
+	    done
+	    RaidLoops["$new_name"]=${RaidLoops["$name"]}
+	    DevList["/dev/md/$new_name"]='wait for activation'
+	    unset RaidLoops["$name"] DevList["/dev/md/$name"]
+	done
+
+	# Flush file system cache, rescan to activate RAID units, pause
+	echo 2 >/proc/sys/vm/drop_caches &&
+	    mdadm -A --scan 2>/dev/null &&
+	    sleep 1 &&
+	    echo 'echo 2 >/proc/sys/vm/drop_caches && mdadm -A --scan && sleep 1' >>$CmdFile
+    fi	    
+    
+    # Get info about any (now hopefully active) RAID devices
+    for name in "${!RaidLoops[@]}"; do
+	DevList["/dev/md/$name"]=$(file -Ls "/dev/md/$name")
+    done
+fi
 
 
 #####
@@ -431,7 +590,15 @@ if [[ $ChangeUUIDs -gt 0 ]]; then
     for ldev in "${!DevList[@]}"; do
 	if [[ "${DevList[$ldev]}" =~ LVM2 ]]; then
 	    [[ $Debug -gt 0 ]] && olduuid=$(pvdisplay -c $ldev | sed 's/.*://')
-	    
+
+	    # Messing around with RAID might have caused LVM volumes
+	    # to activate. We need to deactivate those before we can
+	    # change the PV UUID.
+	    vgname=$(pvdisplay -c $ldev | cut -d: -f2)
+	    vgchange -a n "$vgname" >/dev/null 2>&1 &&
+		echo "vgchange -a n \"$vgname\"" >>$CmdFile
+
+	    # Now we can change the PV UUID
 	    pvchange -u "$ldev" >/dev/null 2>&1 &&
 		echo pvchange -u "$ldev" >>$CmdFile
 
