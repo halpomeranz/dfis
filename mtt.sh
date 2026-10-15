@@ -1,7 +1,7 @@
 #!/bin/bash
 # Hal Pomeranz (hrpomeranz@gmail.com) -- 2026-10-15
 # Distributed under the Creative Commons Attribution-ShareAlike 4.0 license (CC BY-SA 4.0)
-# Version: 3.2.0
+# Version: 3.2.1
 #
 # TODO clean this up
 #shellcheck disable=SC2086
@@ -230,7 +230,8 @@ EOM
     # the new superblock we've already written).
     bitmap_offset=$(echo $bitmap_offset | sed -E 's/(..)(..)(..)(..)/0x\4\3\2\1/')
     chunk_count=$(( (bitmap_offset*2) - 1))   # in 256 byte chunks
-    dd if="$loop_device" bs=256 skip=17 count=$chunk_count 2>/dev/null >>"$tmpfile" && echo "dd if=\"$loop_device\" bs=256 skip=17 count=$chunk_count >>\"$tmpfile\"" >>$CmdFile
+    dd if="$loop_device" bs=256 skip=17 count=$chunk_count 2>/dev/null >>"$tmpfile" &&
+	echo "dd if=\"$loop_device\" bs=256 skip=17 count=$chunk_count >>\"$tmpfile\"" >>$CmdFile
 
     # Now grab the bitmap superblock and swap in the new UUID (no checksum
     #    that we need to fiddle with)
@@ -246,6 +247,7 @@ EOM
 	cat <<EOM >>$CmdFile
 dd if="$tmpfile" of="$loop_device"
 rm -f "$tmpfile"
+
 EOM
     [[ $Debug -gt 0 ]] && echo "+++++ Wrote new superblock to $loop_device"
 }
@@ -400,8 +402,8 @@ fi
 # to this file
 CmdFile="$TargetDir/MOUNTING"
 cp /dev/null "$CmdFile"
-mkdir -p "$TargetDir/files"
-echo mkdir -p \"$TargetDir/files\" >>"$CmdFile"
+mkdir -p "$TargetDir/files" &&
+    echo mkdir -p \"$TargetDir/files\" >>"$CmdFile"
 
 # Supplied image file(s) must be readable
 # Make absolute paths so that commands in MOUNTING file will work anywhere
@@ -560,15 +562,21 @@ if [[ ${#RaidLoops[*]} -gt 0 ]]; then
 	done
 
 	# Flush file system cache, rescan to activate RAID units, pause
-	echo 2 >/proc/sys/vm/drop_caches &&
-	    mdadm -A --scan 2>/dev/null &&
-	    sleep 1 &&
-	    echo 'echo 2 >/proc/sys/vm/drop_caches && mdadm -A --scan && sleep 1' >>$CmdFile
+	echo 3 >/proc/sys/vm/drop_caches 
+	mdadm -A --scan 2>/dev/null
+	sleep 1
+	cat <<EOM >>$CmdFile
+echo 3 >/proc/sys/vm/drop_caches 
+mdadm -A --scan 2>/dev/null
+sleep 1
+
+EOM
     fi	    
     
     # Get info about any (now hopefully active) RAID devices
     for name in "${!RaidLoops[@]}"; do
 	DevList["/dev/md/$name"]=$(file -Ls "/dev/md/$name")
+	[[ $Debug -gt 0 ]] && echo "+++++ RAID device: /dev/md/$name"
     done
 fi
 
