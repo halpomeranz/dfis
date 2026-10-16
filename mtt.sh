@@ -1,7 +1,7 @@
 #!/bin/bash
-# Hal Pomeranz (hrpomeranz@gmail.com) -- 2026-10-15
+# Hal Pomeranz (hrpomeranz@gmail.com) -- 2026-10-16
 # Distributed under the Creative Commons Attribution-ShareAlike 4.0 license (CC BY-SA 4.0)
-# Version: 3.2.1
+# Version: 3.2.2
 #
 # TODO clean this up
 #shellcheck disable=SC2086
@@ -332,10 +332,16 @@ mount_device() {
 	return
     fi
 
+    if [[ $MakeWritable -gt 0 ]]; then
+	options=$(echo $extra | sed -E 's/,//; s/,no(load|recovery)//')
+    else
+	options="ro$extra"
+    fi
+
     # Mount that file system!
-    mount -o ro$extra $device "$targdir"
-    echo mount -o ro$extra $device \"$targdir\" >>"$CmdFile"
-    [[ $Debug -gt 0 ]] && echo +++++ mount -o ro$extra $device \"$targdir\"
+    mount -o $options $device "$targdir"
+    echo mount -o $options $device \"$targdir\" >>"$CmdFile"
+    [[ $Debug -gt 0 ]] && echo +++++ mount -o $options $device \"$targdir\"
 }
 
 
@@ -344,6 +350,7 @@ mount_device() {
 TargetDir='mount'
 Debug=0
 DoXmount=0
+MakeWritable=0
 ChangeUUIDs=0
 NewVGName=
 OldVGName=
@@ -370,6 +377,7 @@ while getopts "A:d:DES:U:V:W" opts; do
 	   DoXmount=1
 	   ;;
 	W) DoXmount=1
+	   MakeWritable=1
 	   ;;
         *) usage
            ;;
@@ -386,7 +394,8 @@ if [[ $Debug -gt 0 ]]; then
     cat <<EOM
 +++++ Image(s): $@
 +++++ Dir: $TargetDir
-+++++ Xmount=$DoXmount / ChangeUUIDs=$ChangeUUIDs / NewVGname=$NewVGName
++++++ Xmount=$DoXmount / MakeWritable=$MakeWritable
++++++ ChangeUUIDs=$ChangeUUIDs / NewVGname=$NewVGName
 +++++ Exports: $MakeExports
 +++++ Debug: $Debug
 EOM
