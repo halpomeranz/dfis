@@ -24,8 +24,8 @@ Usage: $0 [-D] [-W | -V/A newname ] [-E [-S chunksize]] [-d mountpoint] images
     -S size     Specify the max segment size for E01 exports (in bytes)
 
     -W          Mount image with writable cache file
-    -V newname  Change volume group name before mounting (implies -W)
-    -A newname  Change VG name and all UUIDs before mounting (implies -W)
+    -V newname  Change volume group name before mounting
+    -A newname  Change VG name and all UUIDs before mounting
 
     -U dir      Unmount everything on dir
 EOM
